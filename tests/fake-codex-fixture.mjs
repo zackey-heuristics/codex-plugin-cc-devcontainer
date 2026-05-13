@@ -380,6 +380,8 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          sandboxPolicy: message.params.sandboxPolicy ?? null,
+	          sandboxPolicyKeyPresent: Object.prototype.hasOwnProperty.call(message.params || {}, "sandboxPolicy"),
 	          prompt
 	        };
 	        saveState(state);

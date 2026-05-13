@@ -270,6 +270,35 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Devcontainer / Externally Sandboxed Environments
+
+If you run Claude Code inside a devcontainer, Docker, or any environment that is already isolated by an outer sandbox, Codex's own Linux sandbox (bubblewrap / Landlock) can collide with that outer layer and break task-like flows (`/codex:rescue`, `/codex:adversarial-review`, task / resume).
+
+For task-like flows you can opt in to the documented turn-level `sandboxPolicy` override by setting two env vars before `claude` starts (typically in `devcontainer.json`):
+
+| Env var | Allowed values | Default |
+| --- | --- | --- |
+| `CODEX_PLUGIN_TURN_SANDBOX` | `external-sandbox`, `read-only`, `workspace-write`, `off` (or unset) | unset → no override |
+| `CODEX_PLUGIN_TURN_SANDBOX_NETWORK` | `restricted`, `enabled` | `restricted` |
+
+Example `devcontainer.json`:
+
+```jsonc
+{
+  "containerEnv": {
+    "CODEX_PLUGIN_TURN_SANDBOX": "external-sandbox",
+    "CODEX_PLUGIN_TURN_SANDBOX_NETWORK": "restricted"
+  }
+}
+```
+
+Notes:
+
+- Default behavior is unchanged. The plugin only forwards `sandboxPolicy` when you opt in.
+- `danger-full-access` (and its aliases) are intentionally **refused** by the plugin and never sent on `turn/start`. If you need a full bypass, use the Codex CLI directly with its documented `--dangerously-bypass-approvals-and-sandbox` flag.
+- Native `/codex:review` is intentionally **not** covered here; it uses a different control surface (`review/start`). See [ADR 0001](docs/adr/0001-turn-level-sandbox-policy-for-task-flows.md) for the full rationale and upstream issue [openai/codex-plugin-cc#107](https://github.com/openai/codex-plugin-cc/issues/107).
+- A very old Codex app-server may reject the `sandboxPolicy` field. Recovery: unset the env var.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.

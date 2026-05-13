@@ -50,6 +50,7 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import { resolveTurnSandboxPolicy } from "./lib/turn-sandbox-policy.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
@@ -409,6 +410,8 @@ async function executeReviewRun(request) {
     prompt,
     model: request.model,
     sandbox: "read-only",
+    sandboxPolicy:
+      "sandboxPolicy" in request ? request.sandboxPolicy : resolveTurnSandboxPolicy(),
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
   });
@@ -486,6 +489,8 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    sandboxPolicy:
+      "sandboxPolicy" in request ? request.sandboxPolicy : resolveTurnSandboxPolicy(),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -598,7 +603,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, sandboxPolicy }) {
   return {
     cwd,
     model,
@@ -606,7 +611,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    sandboxPolicy: sandboxPolicy ?? null
   };
 }
 
@@ -697,6 +703,12 @@ async function handleReviewCommand(argv, config) {
   });
 
   config.validateRequest?.(target, focusText);
+  // Native /codex:review uses review/start (not turn/start) and is intentionally outside
+  // the scope of Issue #107. Only resolve the env-driven turn-level policy for
+  // adversarial-review so that a bad CODEX_PLUGIN_TURN_SANDBOX value does not surface a
+  // warning during native review.
+  const sandboxPolicy =
+    config.reviewName === "Review" ? null : resolveTurnSandboxPolicy();
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",
@@ -716,6 +728,7 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        sandboxPolicy,
         onProgress: progress
       }),
     { json: options.json }
@@ -750,6 +763,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const sandboxPolicy = resolveTurnSandboxPolicy();
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -767,7 +781,8 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      sandboxPolicy
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
@@ -786,6 +801,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        sandboxPolicy,
         onProgress: progress
       }),
     { json: options.json }
