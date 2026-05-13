@@ -76,6 +76,15 @@ change.
      `/codex:review` branch).
    - `executeTaskRun()` — covers `task`, `rescue`, and `resume`.
 
+   **Prototype-pollution hardening:** The presence check at both call sites
+   uses `Object.hasOwn(request, "sandboxPolicy")` rather than the `in`
+   operator. The `in` operator observes inherited prototype properties, so a
+   polluted `Object.prototype.sandboxPolicy` would bypass the env-driven
+   resolver and silently forward an unintended policy to `turn/start`.
+   `Object.hasOwn` restricts the check to own properties only, ensuring the
+   env-driven `resolveTurnSandboxPolicy()` gate runs whenever the field was
+   not explicitly set on the request object itself.
+
 5. `workspaceWrite.writableRoots` defaults to `[]`. The Codex app-server
    interprets that as "use cwd as writable root" — matching the existing
    thread-level shorthand and avoiding the need to plumb cwd resolution
