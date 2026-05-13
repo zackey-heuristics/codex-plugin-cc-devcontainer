@@ -12,6 +12,7 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
+- Opt-in turn-level `sandboxPolicy` forwarding for [devcontainer and other externally sandboxed environments](#devcontainer--externally-sandboxed-environments)
 
 ## Requirements
 
@@ -123,6 +124,9 @@ Examples:
 
 This command is read-only. It does not fix code.
 
+> [!TIP]
+> If you are running Claude Code inside a devcontainer, Docker, or another externally sandboxed environment, see [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) for the env-var opt-in that keeps this command working.
+
 ### `/codex:rescue`
 
 Hands a task to Codex through the `codex:codex-rescue` subagent.
@@ -161,6 +165,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- inside a devcontainer or other externally sandboxed environment, see [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) to enable the turn-level `sandboxPolicy` opt-in
 
 ### `/codex:status`
 
@@ -270,6 +275,35 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Devcontainer / Externally Sandboxed Environments
+
+If you run Claude Code inside a devcontainer, Docker, or any environment that is already isolated by an outer sandbox, Codex's own Linux sandbox (bubblewrap / Landlock) can collide with that outer layer and break task-like flows (`/codex:rescue`, `/codex:adversarial-review`, task / resume).
+
+For task-like flows you can opt in to the documented turn-level `sandboxPolicy` override by setting two env vars before `claude` starts (typically in `devcontainer.json`):
+
+| Env var | Allowed values | Default |
+| --- | --- | --- |
+| `CODEX_PLUGIN_TURN_SANDBOX` | `external-sandbox`, `read-only`, `workspace-write`, `off` (or unset) | unset → no override |
+| `CODEX_PLUGIN_TURN_SANDBOX_NETWORK` | `restricted`, `enabled` | `restricted` |
+
+Example `devcontainer.json`:
+
+```jsonc
+{
+  "containerEnv": {
+    "CODEX_PLUGIN_TURN_SANDBOX": "external-sandbox",
+    "CODEX_PLUGIN_TURN_SANDBOX_NETWORK": "restricted"
+  }
+}
+```
+
+Notes:
+
+- Default behavior is unchanged. The plugin only forwards `sandboxPolicy` when you opt in.
+- `danger-full-access` (and its aliases) are intentionally **refused** by the plugin and never sent on `turn/start`. If you need a full bypass, use the Codex CLI directly with its documented `--dangerously-bypass-approvals-and-sandbox` flag.
+- Native `/codex:review` is intentionally **not** covered here; it uses a different control surface (`review/start`). See [ADR 0001](docs/adr/0001-turn-level-sandbox-policy-for-task-flows.md) for the full rationale and upstream issue [openai/codex-plugin-cc#107](https://github.com/openai/codex-plugin-cc/issues/107).
+- A very old Codex app-server may reject the `sandboxPolicy` field. Recovery: unset the env var.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
@@ -303,3 +337,7 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+### Can I run this inside a devcontainer or Docker?
+
+Yes, with an explicit opt-in. Codex CLI's built-in Linux sandbox (bubblewrap / Landlock) can collide with an outer sandbox and break task-like flows (`/codex:rescue`, `/codex:adversarial-review`, task / resume). Set `CODEX_PLUGIN_TURN_SANDBOX=external-sandbox` (and optionally `CODEX_PLUGIN_TURN_SANDBOX_NETWORK=enabled`) in your container env so the plugin forwards a turn-level `sandboxPolicy` on `turn/start`. Default behavior is unchanged when you do not set these vars. See [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) for the full setup and the security notes.
