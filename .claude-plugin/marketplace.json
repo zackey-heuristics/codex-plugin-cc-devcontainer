@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "openai-codex-devcontainer",
   "owner": {
-    "name": "OpenAI"
+    "name": "zackey-heuristics"
   },
   "metadata": {
     "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.4"
+    "version": "1.0.4-devcontainer-1"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.4",
+      "version": "1.0.4-devcontainer-1",
       "author": {
-        "name": "OpenAI"
+        "name": "zackey-heuristics (fork of OpenAI codex-plugin-cc)"
       },
       "source": "./plugins/codex"
     }

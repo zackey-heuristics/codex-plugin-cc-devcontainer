@@ -24,13 +24,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add zackey-heuristics/codex-plugin-cc-devcontainer
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@openai-codex-devcontainer
 ```
 
 Reload plugins:
