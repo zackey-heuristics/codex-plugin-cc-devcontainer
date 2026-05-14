@@ -202,9 +202,12 @@ test("materialized review subagents stay narrow Bash forwarders", () => {
     assert.match(
       body,
       new RegExp(
-        `node "\\$\\{CLAUDE_PLUGIN_ROOT\\}/scripts/codex-companion\\.mjs" ${target.command} --invoker claude-subagent <args>`
+        `\`\`\`shell\\nnode "\\$\\{CLAUDE_PLUGIN_ROOT\\}/scripts/codex-companion\\.mjs" ${target.command} --invoker claude-subagent --\\n\`\`\``
       )
     );
+    assert.match(body, /pass each user argument as one shell token wrapped in single quotes/i);
+    assert.match(body, /rewrite each embedded `'` as `'\\''`/);
+    assert.match(body, /Do not evaluate, expand, or split user-provided arguments/i);
     assert.match(body, /Return stdout .* verbatim, exactly as-is, with no commentary\./);
   }
 });
