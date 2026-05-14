@@ -313,6 +313,8 @@ For task-like flows you can opt in to the documented turn-level `sandboxPolicy` 
 | `CODEX_PLUGIN_TURN_SANDBOX` | `external-sandbox`, `read-only`, `workspace-write`, `off` (or unset) | unset → no override |
 | `CODEX_PLUGIN_TURN_SANDBOX_NETWORK` | `restricted`, `enabled` | `restricted` |
 
+> See [docs/devcontainer-sandbox-settings.md](docs/devcontainer-sandbox-settings.md) for a decision guide on which values to pick for your environment (devcontainer with a router service for egress control, plain Docker, offline, host, read-only investigation, etc.).
+
 Example `devcontainer.json`:
 
 ```jsonc
@@ -367,4 +369,4 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 
 ### Can I run this inside a devcontainer or Docker?
 
-Yes, with an explicit opt-in. Codex CLI's built-in Linux sandbox (bubblewrap / Landlock) can collide with an outer sandbox and break task-like flows (`/codex:rescue`, `/codex:adversarial-review`, task / resume). Set `CODEX_PLUGIN_TURN_SANDBOX=external-sandbox` (and optionally `CODEX_PLUGIN_TURN_SANDBOX_NETWORK=enabled`) in your container env so the plugin forwards a turn-level `sandboxPolicy` on `turn/start`. Default behavior is unchanged when you do not set these vars. See [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) for the full setup and the security notes.
+Yes, with an explicit opt-in. Codex CLI's built-in Linux sandbox (bubblewrap / Landlock) can collide with an outer sandbox and break task-like flows (`/codex:rescue`, `/codex:adversarial-review`, task / resume). Set `CODEX_PLUGIN_TURN_SANDBOX=external-sandbox` (and optionally `CODEX_PLUGIN_TURN_SANDBOX_NETWORK=enabled`) in your container env so the plugin forwards a turn-level `sandboxPolicy` on `turn/start`. Default behavior is unchanged when you do not set these vars. See [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) for the full setup and the security notes, and [docs/devcontainer-sandbox-settings.md](docs/devcontainer-sandbox-settings.md) for a decision guide on which values to pick.
