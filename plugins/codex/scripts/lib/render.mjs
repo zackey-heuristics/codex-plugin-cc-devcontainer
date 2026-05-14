@@ -187,6 +187,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    `- review subagents: ${report.reviewSubagentsEnabled ? "enabled" : "disabled"}`,
     ""
   ];
 

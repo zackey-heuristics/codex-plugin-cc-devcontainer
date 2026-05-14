@@ -1,7 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderReviewResult, renderSetupReport, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("renderSetupReport includes review subagent state", () => {
+  const output = renderSetupReport({
+    ready: true,
+    node: { detail: "v24.0.0" },
+    npm: { detail: "10.0.0" },
+    codex: { detail: "installed" },
+    auth: { detail: "logged in" },
+    sessionRuntime: { label: "direct" },
+    reviewGateEnabled: true,
+    reviewSubagentsEnabled: false,
+    actionsTaken: [],
+    nextSteps: []
+  });
+
+  assert.match(output, /^- review gate: enabled$/m);
+  assert.match(output, /^- review subagents: disabled$/m);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
