@@ -653,6 +653,7 @@ export function buildEnv(binDir) {
     CLAUDE_PLUGIN_DATA: _pluginData,
     CODEX_COMPANION_APP_SERVER_ENDPOINT: _brokerEndpoint,
     CODEX_COMPANION_SESSION_ID: _sessionId,
+    CODEX_PLUGIN_REVIEW_RATE_LIMIT: _reviewRateLimit,
     CODEX_PLUGIN_TURN_SANDBOX: _turnSandbox,
     CODEX_PLUGIN_TURN_SANDBOX_NETWORK: _turnSandboxNetwork,
     ...baseEnv

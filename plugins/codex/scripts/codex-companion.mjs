@@ -22,8 +22,10 @@ import {
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { assertInvoker, DEFAULT_INVOKER } from "./lib/invoker.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { enforceReviewRateLimit } from "./lib/review-rate-limit.mjs";
 import { materializeReviewSubagents, removeReviewSubagents } from "./lib/review-subagents.mjs";
 import {
   generateJobId,
@@ -735,7 +737,15 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const invoker = options.invoker ?? "user-slash";
+  const invoker = assertInvoker(options.invoker ?? DEFAULT_INVOKER);
+  enforceReviewRateLimit({
+    workspaceRoot,
+    invoker,
+    env: process.env,
+    now: Date.now(),
+    listJobs,
+    warn: (message) => process.stderr.write(`${message}\n`)
+  });
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,

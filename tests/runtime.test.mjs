@@ -1031,8 +1031,8 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Invoker \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| review-live \| review \| unknown \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
@@ -1174,7 +1174,7 @@ test("status preserves adversarial review kind labels", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /\| review-adv-live \| adversarial-review \| running \| reviewing \|/);
+  assert.match(result.stdout, /\| review-adv-live \| adversarial-review \| unknown \| running \| reviewing \|/);
   assert.match(result.stdout, /- review-adv \| completed \| adversarial-review \| Codex Adversarial Review/);
   assert.match(result.stdout, /Codex session ID: thr_adv_live/);
   assert.match(result.stdout, /Codex session ID: thr_adv_done/);

@@ -173,6 +173,10 @@ invocations remain visible and (optionally) bounded.
   spoofer is only harming their own billing / log integrity, not a
   third party. A future improvement could route a subagent-issued
   identifier through a separate channel; out of scope here.
+- The review rate limit is a soft budget, not a hard quota. Concurrent
+  non-`user-slash` starts can race the non-atomic check and both pass;
+  adding a state-directory lock is accepted as out of scope for this
+  opt-in, disabled-by-default feature.
 - Plugin reinstall wipes the materialized `agents/codex-review.md` and
   `agents/codex-adversarial-review.md` because they live under the
   install dir. Mitigation: `setup --enable-review-subagents` is
