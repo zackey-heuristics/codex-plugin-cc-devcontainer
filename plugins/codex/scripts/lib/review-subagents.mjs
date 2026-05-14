@@ -234,6 +234,19 @@ export function materializeReviewSubagents(pluginRoot = DEFAULT_PLUGIN_ROOT) {
   return targets;
 }
 
+export function areReviewSubagentsMaterialized(pluginRoot = DEFAULT_PLUGIN_ROOT) {
+  try {
+    for (const target of getReviewSubagentTargets(pluginRoot)) {
+      if (!assertManagedRegularTarget(target.targetPath, "inspect")) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Removes only provenance-marked generated agents. The final unlink is
  * necessarily path-based because Node.js does not expose openat/unlinkat. A

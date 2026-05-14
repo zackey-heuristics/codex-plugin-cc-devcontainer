@@ -41,10 +41,12 @@ invocations remain visible and (optionally) bounded.
    - `--enable-review-subagents` — materializes
      `plugins/codex/agents/codex-review.md` and
      `plugins/codex/agents/codex-adversarial-review.md` from templates,
-     and persists `setConfig(workspaceRoot, "reviewSubagentsEnabled", true)`.
-   - `--disable-review-subagents` — removes the two materialized files
-     and sets `reviewSubagentsEnabled: false`. Never touches
-     `codex-rescue.md`.
+     and `setup --json` derives `reviewSubagentsEnabled` from the
+     filesystem via a non-throwing existence + provenance-marker check
+     on both target files (`areReviewSubagentsMaterialized`).
+   - `--disable-review-subagents` — removes the two materialized files,
+     which causes the same filesystem-derived check to report
+     `reviewSubagentsEnabled: false`. Never touches `codex-rescue.md`.
 
    `setup --json` exposes `reviewSubagentsEnabled` so callers can see
    the current state. Setup output explicitly notes that
@@ -165,6 +167,10 @@ invocations remain visible and (optionally) bounded.
 - `--invoker` is also a useful audit field for future analyses —
   "how many reviews were user-initiated vs hook-initiated last week"
   becomes greppable.
+- Enabling or disabling in one workspace is immediately reflected by
+  `setup --json` in every workspace because the materialized files are
+  the single source of truth, matching where Claude Code actually
+  reads them.
 
 **Negative / risk**
 

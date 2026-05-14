@@ -26,7 +26,11 @@ import { assertInvoker, DEFAULT_INVOKER } from "./lib/invoker.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { enforceReviewRateLimit } from "./lib/review-rate-limit.mjs";
-import { materializeReviewSubagents, removeReviewSubagents } from "./lib/review-subagents.mjs";
+import {
+  areReviewSubagentsMaterialized,
+  materializeReviewSubagents,
+  removeReviewSubagents
+} from "./lib/review-subagents.mjs";
 import {
   generateJobId,
   getConfig,
@@ -208,7 +212,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
-    reviewSubagentsEnabled: Boolean(config.reviewSubagentsEnabled),
+    reviewSubagentsEnabled: areReviewSubagentsMaterialized(ROOT_DIR),
     actionsTaken,
     nextSteps
   };
@@ -247,11 +251,9 @@ async function handleSetup(argv) {
 
   if (options["enable-review-subagents"]) {
     materializeReviewSubagents(ROOT_DIR);
-    setConfig(workspaceRoot, "reviewSubagentsEnabled", true);
     actionsTaken.push("Enabled Codex review subagents.");
   } else if (options["disable-review-subagents"]) {
     removeReviewSubagents(ROOT_DIR);
-    setConfig(workspaceRoot, "reviewSubagentsEnabled", false);
     actionsTaken.push("Disabled Codex review subagents.");
   }
 

@@ -325,6 +325,50 @@ test("setup review-subagent flags materialize files and persist config", () => {
   }
 });
 
+test("multi-workspace: setup --json reflects filesystem state across workspaces", () => {
+  const workspaceA = makeTempDir();
+  const workspaceB = makeTempDir();
+  const pluginData = makeTempDir();
+  const targets = getReviewSubagentTargets();
+  const snapshot = snapshotFiles(targets.map((target) => target.targetPath));
+  const env = {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: pluginData
+  };
+
+  try {
+    const enableFromA = run(process.execPath, [SCRIPT, "setup", "--enable-review-subagents", "--json"], {
+      cwd: workspaceA,
+      env
+    });
+    assert.equal(enableFromA.status, 0, enableFromA.stderr);
+    assert.equal(JSON.parse(enableFromA.stdout).reviewSubagentsEnabled, true);
+
+    const reportFromBEnabled = run(process.execPath, [SCRIPT, "setup", "--json"], {
+      cwd: workspaceB,
+      env
+    });
+    assert.equal(reportFromBEnabled.status, 0, reportFromBEnabled.stderr);
+    assert.equal(JSON.parse(reportFromBEnabled.stdout).reviewSubagentsEnabled, true);
+
+    const disableFromA = run(process.execPath, [SCRIPT, "setup", "--disable-review-subagents", "--json"], {
+      cwd: workspaceA,
+      env
+    });
+    assert.equal(disableFromA.status, 0, disableFromA.stderr);
+    assert.equal(JSON.parse(disableFromA.stdout).reviewSubagentsEnabled, false);
+
+    const reportFromBDisabled = run(process.execPath, [SCRIPT, "setup", "--json"], {
+      cwd: workspaceB,
+      env
+    });
+    assert.equal(reportFromBDisabled.status, 0, reportFromBDisabled.stderr);
+    assert.equal(JSON.parse(reportFromBDisabled.stdout).reviewSubagentsEnabled, false);
+  } finally {
+    restoreFiles(snapshot);
+  }
+});
+
 test("setup review-subagent flags are mutually exclusive", () => {
   const result = run(process.execPath, [
     SCRIPT,
