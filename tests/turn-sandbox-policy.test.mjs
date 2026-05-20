@@ -8,7 +8,7 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 import { resolveTurnSandboxPolicy } from "../plugins/codex/scripts/lib/turn-sandbox-policy.mjs";
-import { resolveJobsDir, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveJobsDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -389,8 +389,7 @@ test("native /codex:review accepts the subagent invoker flag without treating it
   assert.doesNotMatch(result.stderr, /does not support custom focus text/);
   assert.match(result.stdout, /Reviewed uncommitted changes/);
 
-  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
-  assert.equal(state.jobs[0].invoker, "claude-subagent");
+  assert.equal(listJobs(repo)[0].invoker, "claude-subagent");
 });
 
 test("native /codex:review rejects duplicate invoker flags", () => {
@@ -416,8 +415,7 @@ test("adversarial-review accepts one invoker flag and persists it", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /# Codex Adversarial Review/);
 
-  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
-  assert.equal(state.jobs[0].invoker, "claude-subagent");
+  assert.equal(listJobs(repo)[0].invoker, "claude-subagent");
 });
 
 test("adversarial-review rejects duplicate invoker flags", () => {

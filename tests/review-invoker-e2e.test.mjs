@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -23,10 +23,6 @@ function setupRepo() {
   return { repo, binDir };
 }
 
-function readState(repo) {
-  return JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
-}
-
 test("review invoker persists to state and status JSON", () => {
   const { repo, binDir } = setupRepo();
   const env = buildEnv(binDir);
@@ -37,7 +33,7 @@ test("review invoker persists to state and status JSON", () => {
   });
 
   assert.equal(review.status, 0, review.stderr);
-  assert.equal(readState(repo).jobs[0].invoker, "claude-subagent");
+  assert.equal(listJobs(repo)[0].invoker, "claude-subagent");
 
   const status = run("node", [SCRIPT, "status", "--json"], {
     cwd: repo,

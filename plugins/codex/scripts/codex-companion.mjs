@@ -36,8 +36,7 @@ import {
   getConfig,
   listJobs,
   setConfig,
-  upsertJob,
-  writeJobFile
+  upsertJob
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -696,7 +695,6 @@ function enqueueBackgroundTask(cwd, job, request) {
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
   return {
@@ -1022,29 +1020,29 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
+  const returnedJob = upsertJob(workspaceRoot, {
     ...existing,
     ...nextJob,
     cancelledAt: completedAt
   });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  const cancelNote =
+    returnedJob.status === "cancelled"
+      ? null
+      : returnedJob.status === "completed"
+        ? "Job had already completed; no action taken."
+        : `Job is already ${returnedJob.status}; no action taken.`;
+  const renderedJob = cancelNote ? { ...returnedJob, cancelNote } : returnedJob;
 
   const payload = {
     jobId: job.id,
-    status: "cancelled",
-    title: job.title,
+    status: returnedJob.status,
+    title: returnedJob.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    ...(cancelNote ? { note: cancelNote } : {})
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  outputCommandResult(payload, renderCancelReport(renderedJob), options.json);
 }
 
 async function main() {
