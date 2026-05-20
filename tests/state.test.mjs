@@ -283,6 +283,69 @@ test("acquireJobLock publishes the lock atomically (no empty-file window)", () =
   assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "first");
 });
 
+test("upsertJob recovers when only a recent releasing side file remains", () => {
+  const workspace = makeTempDir();
+  const jobId = "orphan-releasing-lock";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const sidePath = `${lockPath}.releasing.test-token.${process.hrtime.bigint().toString(36)}`;
+
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(sidePath, "orphan releasing side file\n", "utf8");
+  fs.utimesSync(sidePath, new Date(), new Date());
+
+  const startedAt = Date.now();
+  const job = upsertJob(workspace, { id: jobId, status: "running", phase: "created" });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(job.id, jobId);
+  assert.equal(job.phase, "created");
+  assert.equal(elapsedMs < 500, true, `upsertJob took ${elapsedMs}ms`);
+  assert.equal(fs.existsSync(sidePath), false);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "created");
+});
+
+test("upsertJob still blocks on a recent stealing side file without a lock", () => {
+  const workspace = makeTempDir();
+  const jobId = "orphan-stealing-lock";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const sidePath = `${lockPath}.stealing.test-token.${process.hrtime.bigint().toString(36)}`;
+  const originalAtomicsWait = Atomics.wait;
+
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(sidePath, "in-progress stealing side file\n", "utf8");
+  fs.utimesSync(sidePath, new Date(), new Date());
+
+  try {
+    Atomics.wait = () => "timed-out";
+    const startedAt = Date.now();
+    assert.throws(
+      () => {
+        upsertJob(workspace, { id: jobId, status: "running", phase: "blocked" });
+      },
+      (error) => {
+        assert.equal(error?.name, "JobLockTimeoutError");
+        return true;
+      }
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(elapsedMs < 500, true, `upsertJob took ${elapsedMs}ms`);
+    assert.equal(fs.existsSync(sidePath), true);
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+  }
+
+  fs.unlinkSync(sidePath);
+  const job = upsertJob(workspace, { id: jobId, status: "running", phase: "unblocked" });
+
+  assert.equal(job.id, jobId);
+  assert.equal(job.phase, "unblocked");
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "unblocked");
+});
+
 test("loadState migrates legacy state.json jobs[] into per-job files", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);

@@ -71,6 +71,18 @@ one.
    original holder. Lock files older than a configured staleness window
    are stolen with ownership-checked side-file dance (`*.stealing.<token>`)
    so two would-be stealers cannot both believe they hold the lock.
+
+   Side files come in two flavors and have different blocking semantics:
+
+   - `*.lock.stealing.<token>.<hr>` — a stealer is mid-dance and may
+     restore the lock if its snapshot check fails. A recent one blocks
+     fresh acquirers so the dance can complete.
+   - `*.lock.releasing.<token>.<hr>` — the releaser had already decided
+     to give up the lock; only the final unlink remained. If the
+     releaser is SIGKILL'd between the rename and the unlink, the orphan
+     `.releasing.*` file is safe to drop on sight. An incoming acquirer
+     cleans it up and proceeds. (Without this distinction a crashed
+     releaser would lock the job out for the full staleness window.)
 4. **`upsertJob` is lock-protected and terminal-sticky.** Inside the lock,
    the function re-reads the on-disk file, merges the patch, refuses to
    *demote* a terminal status back to `running`/`queued`, and writes

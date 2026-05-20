@@ -449,7 +449,15 @@ function revalidateJobLock(lockPath, token, jobId) {
 }
 
 function isJobLockSideFileName(entry) {
-  return /\.lock\.(?:stealing|releasing)\./.test(entry);
+  return isJobLockStealingSideFileName(entry) || isJobLockReleasingSideFileName(entry);
+}
+
+function isJobLockStealingSideFileName(entry) {
+  return /\.lock\.stealing\./.test(entry);
+}
+
+function isJobLockReleasingSideFileName(entry) {
+  return /\.lock\.releasing\./.test(entry);
 }
 
 function filesReferToSameInode(leftPath, rightPath) {
@@ -489,7 +497,7 @@ function removeLinkedJobLockSideFiles(lockPath) {
   }
 }
 
-function hasRecentJobLockSideFile(lockPath) {
+function hasRecentBlockingJobLockSideFile(lockPath) {
   const jobsDir = path.dirname(lockPath);
   const lockPrefix = `${path.basename(lockPath)}.`;
   let entries = [];
@@ -509,6 +517,10 @@ function hasRecentJobLockSideFile(lockPath) {
     try {
       const sidePath = path.join(jobsDir, entry);
       if (filesReferToSameInode(lockPath, sidePath)) {
+        continue;
+      }
+      if (isJobLockReleasingSideFileName(entry)) {
+        removeFileIfExists(sidePath);
         continue;
       }
       if (Date.now() - fs.statSync(sidePath).mtimeMs <= JOB_LOCK_STALE_MS) {
@@ -573,7 +585,7 @@ function publishJobLock(lockPath, token) {
       throw new Error(`Failed to verify job lock for ${path.basename(lockPath, ".lock")}.`);
     }
 
-    if (hasRecentJobLockSideFile(lockPath)) {
+    if (hasRecentBlockingJobLockSideFile(lockPath)) {
       releaseJobLock(lockPath, token);
       return false;
     }
@@ -591,7 +603,7 @@ function acquireJobLock(cwd, jobId) {
 
   for (;;) {
     try {
-      if (!hasRecentJobLockSideFile(lockPath) && publishJobLock(lockPath, token)) {
+      if (!hasRecentBlockingJobLockSideFile(lockPath) && publishJobLock(lockPath, token)) {
         return { lockPath, token };
       }
     } catch (error) {
@@ -602,7 +614,7 @@ function acquireJobLock(cwd, jobId) {
 
     if (attempts >= JOB_LOCK_RETRY_COUNT) {
       const staleSnapshot = getStaleJobLockSnapshot(lockPath);
-      if (staleSnapshot.stale && !hasRecentJobLockSideFile(lockPath)) {
+      if (staleSnapshot.stale && !hasRecentBlockingJobLockSideFile(lockPath)) {
         stealStaleJobLock(lockPath, staleSnapshot, token);
         attempts = 0;
         continue;
