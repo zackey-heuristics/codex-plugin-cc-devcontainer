@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -336,9 +336,7 @@ test("review logs reasoning summaries and review output to the job log", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = fs.readFileSync(listJobs(repo)[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Reviewed the changed files and checked the likely regression paths/);
   assert.match(log, /Review output/);
@@ -663,9 +661,7 @@ test("task logs reasoning summaries and assistant messages to the job log", () =
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = fs.readFileSync(listJobs(repo)[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Inspected the prompt, gathered evidence, and checked the highest-risk paths first/);
   assert.match(log, /Assistant message/);
@@ -687,9 +683,7 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = fs.readFileSync(listJobs(repo)[0].logFile, "utf8");
   assert.match(log, /Starting subagent design-challenger via collaboration tool: wait\./);
   assert.match(log, /Subagent design-challenger reasoning:/);
   assert.match(log, /Questioned the retry strategy and the cache invalidation boundaries\./);
@@ -717,9 +711,7 @@ test("task ignores unrelated buffered collab receiver metadata", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 
-  const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  const log = fs.readFileSync(listJobs(repo)[0].logFile, "utf8");
   assert.doesNotMatch(log, /unrelated-intruder/);
   assert.doesNotMatch(log, /UNRELATED SUBAGENT OUTPUT SHOULD NOT APPEAR/);
 });
@@ -976,6 +968,13 @@ test("status shows phases, hints, and the latest finished job", () => {
         id: "review-done",
         status: "completed",
         title: "Codex Review",
+        jobClass: "review",
+        threadId: "thr_done",
+        summary: "Review main...HEAD",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        startedAt: "2026-03-18T15:10:05.000Z",
+        completedAt: "2026-03-18T15:11:10.000Z",
+        updatedAt: "2026-03-18T15:11:10.000Z",
         rendered: "# Codex Review\n\nReviewed uncommitted changes.\nNo material issues found.\n"
       },
       null,
@@ -1195,7 +1194,12 @@ test("status --wait times out cleanly when a job is still active", () => {
         id: "task-live",
         status: "running",
         title: "Codex Task",
-        logFile
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
       },
       null,
       2
@@ -1316,7 +1320,12 @@ test("result without a job id prefers the latest finished job from the current C
         id: "review-current",
         status: "completed",
         title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
         threadId: "thr_current",
+        summary: "Current session review",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        updatedAt: "2026-03-18T15:11:00.000Z",
         result: {
           codex: {
             stdout: "Current session output."
@@ -1336,7 +1345,12 @@ test("result without a job id prefers the latest finished job from the current C
         id: "review-other",
         status: "completed",
         title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-other",
         threadId: "thr_other",
+        summary: "Old session review",
+        createdAt: "2026-03-18T15:20:00.000Z",
+        updatedAt: "2026-03-18T15:21:00.000Z",
         result: {
           codex: {
             stdout: "Old session output."
@@ -1462,7 +1476,13 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
         id: "task-live",
         status: "running",
         title: "Codex Task",
-        logFile
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        pid: sleeper.pid,
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
       },
       null,
       2
@@ -1512,8 +1532,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  const cancelled = state.jobs.find((job) => job.id === "task-live");
+  const cancelled = listJobs(workspace).find((job) => job.id === "task-live");
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.pid, null);
 
@@ -1573,8 +1592,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(cancel.status, 1);
   assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.equal(state.jobs[0].status, "running");
+  assert.equal(listJobs(workspace)[0].status, "running");
 });
 
 test("cancel with a job id can still target an active job from another Claude session", () => {
@@ -1621,8 +1639,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(listJobs(workspace)[0].status, "cancelled");
 });
 
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
@@ -1646,10 +1663,8 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   const jobId = launchPayload.jobId;
   assert.ok(jobId);
 
-  const stateDir = resolveStateDir(repo);
   const runningJob = await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    const job = listJobs(repo).find((candidate) => candidate.id === jobId);
     if (job?.status === "running" && job.threadId && job.turnId) {
       return job;
     }
@@ -1689,7 +1704,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("session end removes terminal jobs and cancels active jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -1709,8 +1724,40 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedLog, "completed\n", "utf8");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   fs.writeFileSync(otherSessionLog, "other\n", "utf8");
-  fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
-  fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
+  fs.writeFileSync(
+    completedJobFile,
+    JSON.stringify(
+      {
+        id: "review-completed",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        logFile: completedLog,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:31:00.000Z"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  fs.writeFileSync(
+    otherJobFile,
+    JSON.stringify(
+      {
+        id: "review-other",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-other",
+        logFile: otherSessionLog,
+        createdAt: "2026-03-18T15:34:00.000Z",
+        updatedAt: "2026-03-18T15:35:00.000Z"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
 
   const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: repo,
@@ -1718,7 +1765,24 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     stdio: "ignore"
   });
   sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  fs.writeFileSync(
+    runningJobFile,
+    JSON.stringify(
+      {
+        id: "review-running",
+        status: "running",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        pid: sleeper.pid,
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
 
   t.after(() => {
     try {
@@ -1793,7 +1857,12 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
+    [
+      path.basename(otherJobFile),
+      path.basename(otherSessionLog),
+      path.basename(runningJobFile),
+      path.basename(runningLog)
+    ].sort()
   );
 
   await waitFor(() => {
@@ -1805,9 +1874,16 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
+  const jobs = listJobs(repo);
+  const jobsById = new Map(jobs.map((job) => [job.id, job]));
+  assert.deepEqual([...jobsById.keys()].sort(), ["review-other", "review-running"]);
+  const runningJob = jobsById.get("review-running");
+  assert.equal(runningJob.status, "cancelled");
+  assert.equal(runningJob.phase, "cancelled");
+  assert.equal(runningJob.pid, null);
+  assert.equal(runningJob.errorMessage, "Cancelled by session end.");
+  assert.equal(runningJob.logFile, runningLog);
+  const otherJob = jobsById.get("review-other");
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 

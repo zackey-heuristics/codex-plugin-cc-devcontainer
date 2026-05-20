@@ -6,12 +6,13 @@ import assert from "node:assert/strict";
 
 import { buildStatusSnapshot } from "../plugins/codex/scripts/lib/job-control.mjs";
 import {
+  renderCancelReport,
   renderReviewResult,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult
 } from "../plugins/codex/scripts/lib/render.mjs";
-import { saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { saveState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { SESSION_ID_ENV } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 test("renderSetupReport includes review subagent state", () => {
@@ -30,6 +31,19 @@ test("renderSetupReport includes review subagent state", () => {
 
   assert.match(output, /^- review gate: enabled$/m);
   assert.match(output, /^- review subagents: disabled$/m);
+});
+
+test("renderCancelReport surfaces when a job was already terminal", () => {
+  const output = renderCancelReport({
+    id: "task-finished",
+    status: "completed",
+    title: "Codex Task",
+    cancelNote: "Job had already completed; no action taken."
+  });
+
+  assert.match(output, /Did not cancel task-finished\./);
+  assert.match(output, /Job had already completed; no action taken\./);
+  assert.match(output, /- Title: Codex Task/);
 });
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
@@ -204,38 +218,38 @@ test("buildStatusSnapshot counts review invokers across workspace sessions", () 
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "codex-status-snapshot-"));
   const now = Date.parse("2026-05-14T12:00:00.000Z");
 
-  saveState(workspace, {
-    config: { stopReviewGate: false },
-    jobs: [
-      {
-        id: "review-current",
-        status: "completed",
-        jobClass: "review",
-        sessionId: "sess-current",
-        invoker: "claude-subagent",
-        createdAt: "2026-05-14T11:30:00.000Z",
-        updatedAt: "2026-05-14T11:30:10.000Z"
-      },
-      {
-        id: "review-other-1",
-        status: "completed",
-        jobClass: "review",
-        sessionId: "sess-other",
-        invoker: "claude-subagent",
-        createdAt: "2026-05-14T11:40:00.000Z",
-        updatedAt: "2026-05-14T11:40:10.000Z"
-      },
-      {
-        id: "review-other-2",
-        status: "completed",
-        jobClass: "review",
-        sessionId: "sess-other",
-        invoker: "claude-subagent",
-        createdAt: "2026-05-14T11:50:00.000Z",
-        updatedAt: "2026-05-14T11:50:10.000Z"
-      }
-    ]
-  });
+  saveState(workspace, { config: { stopReviewGate: false } });
+  for (const job of [
+    {
+      id: "review-current",
+      status: "completed",
+      jobClass: "review",
+      sessionId: "sess-current",
+      invoker: "claude-subagent",
+      createdAt: "2026-05-14T11:30:00.000Z",
+      updatedAt: "2026-05-14T11:30:10.000Z"
+    },
+    {
+      id: "review-other-1",
+      status: "completed",
+      jobClass: "review",
+      sessionId: "sess-other",
+      invoker: "claude-subagent",
+      createdAt: "2026-05-14T11:40:00.000Z",
+      updatedAt: "2026-05-14T11:40:10.000Z"
+    },
+    {
+      id: "review-other-2",
+      status: "completed",
+      jobClass: "review",
+      sessionId: "sess-other",
+      invoker: "claude-subagent",
+      createdAt: "2026-05-14T11:50:00.000Z",
+      updatedAt: "2026-05-14T11:50:10.000Z"
+    }
+  ]) {
+    upsertJob(workspace, job);
+  }
 
   const snapshot = buildStatusSnapshot(workspace, {
     env: { [SESSION_ID_ENV]: "sess-current" },

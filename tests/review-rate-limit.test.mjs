@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { assertInvoker, DEFAULT_INVOKER, INVOKER_VALUES } from "../plugins/codex/scripts/lib/invoker.mjs";
 import { enforceReviewRateLimit, parseReviewRateLimit } from "../plugins/codex/scripts/lib/review-rate-limit.mjs";
-import { listJobs, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, saveState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 function invalidRateLimitWarning(raw) {
@@ -246,9 +246,11 @@ test("enforceReviewRateLimit counts more than fifty recent persisted review reco
 
   saveState(workspaceRoot, {
     version: 1,
-    config: { stopReviewGate: false },
-    jobs
+    config: { stopReviewGate: false }
   });
+  for (const job of jobs) {
+    upsertJob(workspaceRoot, job);
+  }
 
   assert.throws(
     () =>

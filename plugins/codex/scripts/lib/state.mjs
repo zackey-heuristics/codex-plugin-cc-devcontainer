@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,29 @@ const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 export const MAX_RECENT_REVIEW_JOBS = 500;
 const RECENT_REVIEW_RETENTION_MS = 65 * 60_000;
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STICKY_FIELDS = ["phase", "completedAt", "cancelledAt", "errorMessage", "result", "rendered", "pid"];
+const JOB_LOCK_RETRY_COUNT = 200;
+const JOB_LOCK_RETRY_DELAY_MS = 25;
+const JOB_LOCK_INCOMPLETE_STALE_MS = JOB_LOCK_RETRY_COUNT * JOB_LOCK_RETRY_DELAY_MS;
+const JOB_LOCK_STALE_MS = 60_000;
+const JOB_LOCK_SLEEP_VIEW = new Int32Array(new SharedArrayBuffer(4));
+const SAFE_JOB_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+class JobLockTimeoutError extends Error {
+  constructor(jobId) {
+    super(`Timed out acquiring job lock for ${jobId}.`);
+    this.name = "JobLockTimeoutError";
+  }
+}
+
+class JobLockStolenError extends Error {
+  constructor(jobId) {
+    super(`Job lock for ${jobId} was stolen before the write could be committed.`);
+    this.name = "JobLockStolenError";
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -24,8 +47,7 @@ function defaultState() {
     config: {
       stopReviewGate: false,
       reviewSubagentsEnabled: false
-    },
-    jobs: []
+    }
   };
 }
 
@@ -58,26 +80,110 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function normalizeState(value) {
+  const parsed = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    version: Number.isInteger(parsed.version) ? parsed.version : STATE_VERSION,
+    config: {
+      ...defaultState().config,
+      ...(parsed.config ?? {})
+    }
+  };
+}
+
+function atomicWriteJsonFile(filePath, value, options = undefined) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpFile = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  );
+
+  try {
+    fs.writeFileSync(tmpFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    options?.beforeRename?.();
+    fs.renameSync(tmpFile, filePath);
+  } catch (error) {
+    removeFileIfExists(tmpFile);
+    throw error;
+  }
+}
+
+function writeFlushedJsonTempFile(filePath, value) {
+  const tmpFile = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  );
+  let fd = null;
+
+  try {
+    fd = fs.openSync(tmpFile, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o666);
+    fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    return tmpFile;
+  } catch (error) {
+    if (fd != null) {
+      fs.closeSync(fd);
+    }
+    removeFileIfExists(tmpFile);
+    throw error;
+  }
+}
+
+function writeJobFileExclusive(cwd, job) {
+  if (!job || typeof job !== "object") {
+    return;
+  }
+
+  ensureStateDir(cwd);
+  const jobFile = resolveJobFile(cwd, job.id);
+  let tmpFile = null;
+  try {
+    tmpFile = writeFlushedJsonTempFile(jobFile, job);
+    fs.linkSync(tmpFile, jobFile);
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+  } finally {
+    removeFileIfExists(tmpFile);
+  }
+}
+
+function migrateLegacyJobs(cwd, jobs) {
+  for (const job of jobs) {
+    try {
+      writeJobFileExclusive(cwd, job);
+    } catch (error) {
+      if (isInvalidJobIdError(error)) {
+        process.stderr.write(`Skipping legacy job ${JSON.stringify(job?.id ?? null)}: Invalid job id\n`);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
     return defaultState();
   }
 
+  let parsed;
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
+    parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   } catch {
     return defaultState();
   }
+
+  const state = normalizeState(parsed);
+  if (Array.isArray(parsed.jobs)) {
+    migrateLegacyJobs(cwd, parsed.jobs);
+    atomicWriteJsonFile(stateFile, state);
+  }
+  return state;
 }
 
 function sortJobsByUpdatedDesc(jobs) {
@@ -141,34 +247,474 @@ function pruneJobs(jobs) {
 }
 
 function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
+  if (!filePath) {
+    return;
+  }
+  try {
     fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+function sleepSync(ms) {
+  Atomics.wait(JOB_LOCK_SLEEP_VIEW, 0, 0, ms);
+}
+
+function createJobLockToken() {
+  return `${process.pid}.${process.hrtime.bigint().toString(36)}.${randomBytes(8).toString("hex")}`;
+}
+
+function readProcessUid(pid) {
+  try {
+    const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = /^Uid:\s+(\d+)/m.exec(status);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function getPidStatus(pid) {
+  try {
+    process.kill(pid, 0);
+    return { exists: true, permissionDenied: false, sameUser: true };
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return { exists: false, permissionDenied: false, sameUser: false };
+    }
+
+    if (error?.code === "EPERM") {
+      const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+      const ownerUid = currentUid == null ? null : readProcessUid(pid);
+      return {
+        exists: true,
+        permissionDenied: true,
+        sameUser: ownerUid == null || currentUid == null ? null : ownerUid === currentUid
+      };
+    }
+
+    return { exists: true, permissionDenied: false, sameUser: false };
+  }
+}
+
+function isLockFileOlderThan(lockPath, ageMs) {
+  try {
+    return Date.now() - fs.statSync(lockPath).mtimeMs > ageMs;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true;
+    }
+    throw error;
+  }
+}
+
+function readJobLockSnapshot(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    try {
+      const lock = JSON.parse(raw);
+      return { exists: true, parsed: true, raw, lock };
+    } catch {
+      return { exists: true, parsed: false, raw, lock: null };
+    }
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { exists: false, parsed: false, raw: "", lock: null };
+    }
+    throw error;
+  }
+}
+
+function getStaleJobLockSnapshot(lockPath) {
+  const snapshot = readJobLockSnapshot(lockPath);
+  if (!snapshot.exists) {
+    return { ...snapshot, stale: true };
+  }
+  if (!snapshot.parsed) {
+    return { ...snapshot, stale: isLockFileOlderThan(lockPath, JOB_LOCK_INCOMPLETE_STALE_MS) };
+  }
+
+  const lock = snapshot.lock;
+  const acquiredAtMs = Date.parse(lock?.acquiredAt ?? "");
+  // An alive process with a parsed lock older than 60s is stale by design to recover from hung owners.
+  const isOld = Number.isFinite(acquiredAtMs) && Date.now() - acquiredAtMs > JOB_LOCK_STALE_MS;
+  const pid = Number(lock?.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ...snapshot, stale: true };
+  }
+
+  const pidStatus = getPidStatus(pid);
+  return {
+    ...snapshot,
+    stale: isOld || !pidStatus.exists || (pidStatus.permissionDenied && pidStatus.sameUser === false)
+  };
+}
+
+function isStaleJobLock(lockPath) {
+  return getStaleJobLockSnapshot(lockPath).stale;
+}
+
+function jobLockSnapshotsMatch(left, right) {
+  if (left.parsed && right.parsed) {
+    return (
+      Number(left.lock?.pid) === Number(right.lock?.pid) &&
+      left.lock?.acquiredAt === right.lock?.acquiredAt &&
+      left.lock?.token === right.lock?.token
+    );
+  }
+  return !left.parsed && !right.parsed && left.raw === right.raw;
+}
+
+function restoreRenamedLockFile(sidePath, lockPath) {
+  try {
+    fs.linkSync(sidePath, lockPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST" || error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function stealStaleJobLock(lockPath, staleSnapshot, token) {
+  if (!staleSnapshot.exists) {
+    return true;
+  }
+
+  const sidePath = `${lockPath}.stealing.${token}.${process.hrtime.bigint().toString(36)}`;
+  try {
+    fs.renameSync(lockPath, sidePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true;
+    }
+    throw error;
+  }
+
+  try {
+    const renamedSnapshot = readJobLockSnapshot(sidePath);
+    if (renamedSnapshot.exists && jobLockSnapshotsMatch(staleSnapshot, renamedSnapshot)) {
+      removeFileIfExists(sidePath);
+      return true;
+    }
+
+    restoreRenamedLockFile(sidePath, lockPath);
+    return false;
+  } catch (error) {
+    restoreRenamedLockFile(sidePath, lockPath);
+    throw error;
+  }
+}
+
+function releaseJobLock(lockPath, token) {
+  const snapshot = readJobLockSnapshot(lockPath);
+  if (!snapshot.exists || !snapshot.parsed || snapshot.lock?.token !== token) {
+    return;
+  }
+
+  removeLinkedJobLockSideFiles(lockPath);
+  const sidePath = `${lockPath}.releasing.${token}.${process.hrtime.bigint().toString(36)}`;
+  try {
+    fs.renameSync(lockPath, sidePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  try {
+    const renamedSnapshot = readJobLockSnapshot(sidePath);
+    if (renamedSnapshot.exists && renamedSnapshot.parsed && renamedSnapshot.lock?.token === token) {
+      removeFileIfExists(sidePath);
+      return;
+    }
+
+    restoreRenamedLockFile(sidePath, lockPath);
+  } catch (error) {
+    restoreRenamedLockFile(sidePath, lockPath);
+    throw error;
+  }
+}
+
+function revalidateJobLock(lockPath, token, jobId) {
+  const snapshot = readJobLockSnapshot(lockPath);
+  if (!snapshot.exists || !snapshot.parsed || snapshot.lock?.token !== token) {
+    throw new JobLockStolenError(jobId);
+  }
+}
+
+function isJobLockSideFileName(entry) {
+  return isJobLockStealingSideFileName(entry) || isJobLockReleasingSideFileName(entry);
+}
+
+function isJobLockStealingSideFileName(entry) {
+  return /\.lock\.stealing\./.test(entry);
+}
+
+function isJobLockReleasingSideFileName(entry) {
+  return /\.lock\.releasing\./.test(entry);
+}
+
+function filesReferToSameInode(leftPath, rightPath) {
+  try {
+    const left = fs.statSync(leftPath);
+    const right = fs.statSync(rightPath);
+    return left.dev === right.dev && left.ino === right.ino;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function removeLinkedJobLockSideFiles(lockPath) {
+  const jobsDir = path.dirname(lockPath);
+  const lockPrefix = `${path.basename(lockPath)}.`;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(jobsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.startsWith(lockPrefix) || !isJobLockSideFileName(entry)) {
+      continue;
+    }
+    const sidePath = path.join(jobsDir, entry);
+    if (filesReferToSameInode(lockPath, sidePath)) {
+      removeFileIfExists(sidePath);
+    }
+  }
+}
+
+function hasRecentBlockingJobLockSideFile(lockPath) {
+  const jobsDir = path.dirname(lockPath);
+  const lockPrefix = `${path.basename(lockPath)}.`;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(jobsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.startsWith(lockPrefix) || !isJobLockSideFileName(entry)) {
+      continue;
+    }
+    try {
+      const sidePath = path.join(jobsDir, entry);
+      if (filesReferToSameInode(lockPath, sidePath)) {
+        continue;
+      }
+      if (isJobLockReleasingSideFileName(entry)) {
+        removeFileIfExists(sidePath);
+        continue;
+      }
+      if (Date.now() - fs.statSync(sidePath).mtimeMs <= JOB_LOCK_STALE_MS) {
+        return true;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return false;
+}
+
+function cleanupStaleJobLockSideFiles(cwd) {
+  const jobsDir = resolveJobsDir(cwd);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(jobsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!isJobLockSideFileName(entry)) {
+      continue;
+    }
+    const sidePath = path.join(jobsDir, entry);
+    try {
+      if (Date.now() - fs.statSync(sidePath).mtimeMs > JOB_LOCK_STALE_MS) {
+        removeFileIfExists(sidePath);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+}
+
+function publishJobLock(lockPath, token) {
+  const lock = { pid: process.pid, acquiredAt: nowIso(), token };
+  let tmpFile = null;
+
+  try {
+    tmpFile = writeFlushedJsonTempFile(lockPath, lock);
+    try {
+      fs.linkSync(tmpFile, lockPath);
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+
+    const snapshot = readJobLockSnapshot(lockPath);
+    if (!snapshot.parsed || snapshot.lock?.token !== token) {
+      releaseJobLock(lockPath, token);
+      throw new Error(`Failed to verify job lock for ${path.basename(lockPath, ".lock")}.`);
+    }
+
+    if (hasRecentBlockingJobLockSideFile(lockPath)) {
+      releaseJobLock(lockPath, token);
+      return false;
+    }
+
+    return true;
+  } finally {
+    removeFileIfExists(tmpFile);
+  }
+}
+
+function acquireJobLock(cwd, jobId) {
+  const lockPath = resolveJobLockFile(cwd, jobId);
+  const token = createJobLockToken();
+  let attempts = 0;
+
+  for (;;) {
+    try {
+      if (!hasRecentBlockingJobLockSideFile(lockPath) && publishJobLock(lockPath, token)) {
+        return { lockPath, token };
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    if (attempts >= JOB_LOCK_RETRY_COUNT) {
+      const staleSnapshot = getStaleJobLockSnapshot(lockPath);
+      if (staleSnapshot.stale && !hasRecentBlockingJobLockSideFile(lockPath)) {
+        stealStaleJobLock(lockPath, staleSnapshot, token);
+        attempts = 0;
+        continue;
+      }
+      throw new JobLockTimeoutError(jobId);
+    }
+
+    attempts += 1;
+    sleepSync(JOB_LOCK_RETRY_DELAY_MS);
+  }
+}
+
+function withJobLock(cwd, jobId, fn) {
+  // Per-job lock serializes cross-process read/write and prune/delete critical sections.
+  const { lockPath, token } = acquireJobLock(cwd, jobId);
+  try {
+    return fn(() => revalidateJobLock(lockPath, token, jobId));
+  } finally {
+    releaseJobLock(lockPath, token);
+  }
+}
+
+function hasOwn(value, field) {
+  return Object.prototype.hasOwnProperty.call(value, field);
+}
+
+function isActiveJobStatus(status) {
+  return ACTIVE_JOB_STATUSES.has(status);
+}
+
+function isTerminalJobStatus(status) {
+  return TERMINAL_JOB_STATUSES.has(status);
+}
+
+function preserveTerminalJob(existing, nextJob) {
+  const preserved = {
+    ...nextJob,
+    status: existing.status
+  };
+
+  for (const field of TERMINAL_STICKY_FIELDS) {
+    if (hasOwn(existing, field)) {
+      preserved[field] = existing[field];
+    } else {
+      delete preserved[field];
+    }
+  }
+
+  return preserved;
+}
+
+function isPathInDirectory(parentDir, candidatePath) {
+  if (!candidatePath) {
+    return false;
+  }
+
+  const relative = path.relative(parentDir, candidatePath);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+export function assertSafeJobId(jobId) {
+  if (
+    typeof jobId !== "string" ||
+    jobId === "." ||
+    jobId === ".." ||
+    jobId.includes("/") ||
+    jobId.includes("\\") ||
+    !SAFE_JOB_ID_PATTERN.test(jobId)
+  ) {
+    throw new Error("Invalid job id");
+  }
+  return jobId;
+}
+
+function isInvalidJobIdError(error) {
+  return error instanceof Error && error.message === "Invalid job id";
+}
+
+function resolveJobPath(cwd, jobId, extension) {
+  const safeJobId = assertSafeJobId(jobId);
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+  const jobsDir = resolveJobsDir(cwd);
+  const jobPath = path.join(jobsDir, `${safeJobId}${extension}`);
+  if (!isPathInDirectory(path.resolve(jobsDir), path.resolve(jobPath))) {
+    throw new Error("Invalid job id");
+  }
+  return jobPath;
+}
+
+export function saveState(cwd, state) {
+  ensureStateDir(cwd);
   const nextState = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
-      ...(state.config ?? {})
-    },
-    jobs: nextJobs
+      ...(state?.config ?? {})
+    }
   };
 
-  const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
-    }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
-  }
-
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  atomicWriteJsonFile(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
@@ -184,27 +730,76 @@ export function generateJobId(prefix = "job") {
 }
 
 export function upsertJob(cwd, jobPatch) {
-  return updateState(cwd, (state) => {
+  if (!jobPatch || !hasOwn(jobPatch, "id")) {
+    throw new Error("Cannot upsert a job without an id.");
+  }
+  assertSafeJobId(jobPatch.id);
+
+  ensureStateDir(cwd);
+  const nextJob = withJobLock(cwd, jobPatch.id, (revalidateLock) => {
     const timestamp = nowIso();
-    const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
-    if (existingIndex === -1) {
-      state.jobs.unshift({
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        ...jobPatch
-      });
-      return;
+    const jobFile = resolveJobFile(cwd, jobPatch.id);
+    let existing = null;
+    try {
+      existing = readJobFile(jobFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
     }
-    state.jobs[existingIndex] = {
-      ...state.jobs[existingIndex],
-      ...jobPatch,
-      updatedAt: timestamp
-    };
+    let mergedJob = existing
+      ? {
+          ...existing,
+          ...jobPatch,
+          createdAt: existing.createdAt ?? jobPatch.createdAt ?? timestamp,
+          updatedAt: timestamp
+        }
+      : {
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          ...jobPatch
+        };
+    if (existing && isTerminalJobStatus(existing.status)) {
+      mergedJob = preserveTerminalJob(existing, mergedJob);
+    }
+
+    writeJobFileUnlocked(cwd, jobPatch.id, mergedJob, { beforeRename: revalidateLock });
+    return mergedJob;
   });
+  pruneJobsOnDisk(cwd);
+  return nextJob;
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  loadState(cwd);
+  const jobsDir = resolveJobsDir(cwd);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(jobsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const jobs = [];
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+
+    try {
+      const parsed = readJobFile(path.join(jobsDir, entry));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        jobs.push(parsed);
+      }
+    } catch {
+      // Ignore partially-written, corrupt, or unreadable job files.
+    }
+  }
+
+  return sortJobsByUpdatedDesc(jobs);
 }
 
 export function setConfig(cwd, key, value) {
@@ -220,11 +815,35 @@ export function getConfig(cwd) {
   return loadState(cwd).config;
 }
 
-export function writeJobFile(cwd, jobId, payload) {
+function writeJobFileUnlocked(cwd, jobId, payload, options = undefined) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  atomicWriteJsonFile(jobFile, payload, options);
   return jobFile;
+}
+
+export function writeJobFileForTest(cwd, jobId, payload) {
+  assertSafeJobId(jobId);
+  if (payload && typeof payload === "object" && hasOwn(payload, "id")) {
+    assertSafeJobId(payload.id);
+  }
+  // Test-only seeding keeps raw payload fields while still respecting the lock and terminal stickiness.
+  return withJobLock(cwd, jobId, (revalidateLock) => {
+    const jobFile = resolveJobFile(cwd, jobId);
+    let nextPayload = payload;
+    try {
+      const existing = readJobFile(jobFile);
+      if (existing && isTerminalJobStatus(existing.status)) {
+        nextPayload = preserveTerminalJob(existing, payload);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    writeJobFileUnlocked(cwd, jobId, nextPayload, { beforeRename: revalidateLock });
+    return jobFile;
+  });
 }
 
 export function readJobFile(jobFile) {
@@ -232,17 +851,156 @@ export function readJobFile(jobFile) {
 }
 
 function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
+  removeFileIfExists(jobFile);
+}
+
+function removeJobLogFiles(cwd, job) {
+  const stateDir = resolveStateDir(cwd);
+  const siblingLogFile = resolveJobLogFile(cwd, job.id);
+  removeFileIfExists(siblingLogFile);
+  if (job.logFile && job.logFile !== siblingLogFile && isPathInDirectory(stateDir, job.logFile)) {
+    removeFileIfExists(job.logFile);
   }
 }
 
+export function pruneJobsOnDisk(cwd) {
+  cleanupStaleJobLockSideFiles(cwd);
+  const jobs = listJobs(cwd);
+  const retainedIds = new Set(pruneJobs(jobs).map((job) => job.id));
+
+  for (const job of jobs) {
+    if (retainedIds.has(job.id)) {
+      continue;
+    }
+    if (isActiveJobStatus(job.status)) {
+      continue;
+    }
+
+    try {
+      assertSafeJobId(job.id);
+      withJobLock(cwd, job.id, (revalidateLock) => {
+        const jobFile = resolveJobFile(cwd, job.id);
+        let currentJob = null;
+        try {
+          currentJob = readJobFile(jobFile);
+        } catch (error) {
+          if (error?.code !== "ENOENT") {
+            throw error;
+          }
+          return;
+        }
+        if (currentJob.updatedAt !== job.updatedAt || isActiveJobStatus(currentJob.status)) {
+          return;
+        }
+
+        revalidateLock();
+        removeJobFile(jobFile);
+        removeJobLogFiles(cwd, currentJob);
+      });
+    } catch (error) {
+      if (isInvalidJobIdError(error)) {
+        process.stderr.write(`Skipping pruned job ${JSON.stringify(job.id)}: Invalid job id\n`);
+        continue;
+      }
+      if (error instanceof JobLockTimeoutError) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+export function deleteSessionJobs(cwd, sessionId, options = undefined) {
+  if (!sessionId) {
+    return [];
+  }
+
+  const onMatchUnderLock =
+    typeof options?.onMatchUnderLock === "function" ? options.onMatchUnderLock : undefined;
+  const jobs = listJobs(cwd);
+  const deletedIds = [];
+
+  for (const job of jobs) {
+    if (!job?.id || job.sessionId !== sessionId) {
+      continue;
+    }
+
+    try {
+      assertSafeJobId(job.id);
+      withJobLock(cwd, job.id, (revalidateLock) => {
+        const jobFile = resolveJobFile(cwd, job.id);
+        let currentJob = null;
+        try {
+          currentJob = readJobFile(jobFile);
+        } catch (error) {
+          if (error?.code !== "ENOENT") {
+            throw error;
+          }
+          return;
+        }
+
+        if (currentJob.sessionId !== sessionId) {
+          return;
+        }
+
+        if (onMatchUnderLock) {
+          try {
+            // Runs synchronously under the per-job lock before mutating the matched job.
+            onMatchUnderLock(currentJob);
+          } catch (error) {
+            const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+            process.stderr.write(`Skipping session job ${currentJob.id ?? job.id}: ${detail}\n`);
+            return;
+          }
+        }
+
+        if (isActiveJobStatus(currentJob.status)) {
+          const timestamp = nowIso();
+          writeJobFileUnlocked(
+            cwd,
+            job.id,
+            {
+              ...currentJob,
+              status: "cancelled",
+              phase: "cancelled",
+              pid: null,
+              completedAt: timestamp,
+              errorMessage: "Cancelled by session end.",
+              cancelledAt: timestamp,
+              updatedAt: timestamp
+            },
+            { beforeRename: revalidateLock }
+          );
+        } else {
+          revalidateLock();
+          removeJobFile(jobFile);
+          removeJobLogFiles(cwd, currentJob);
+        }
+        deletedIds.push(job.id);
+      });
+    } catch (error) {
+      if (isInvalidJobIdError(error)) {
+        process.stderr.write(`Skipping session job ${JSON.stringify(job.id)}: Invalid job id\n`);
+        continue;
+      }
+      if (error instanceof JobLockTimeoutError) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  return deletedIds;
+}
+
 export function resolveJobLogFile(cwd, jobId) {
-  ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.log`);
+  return resolveJobPath(cwd, jobId, ".log");
 }
 
 export function resolveJobFile(cwd, jobId) {
-  ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  return resolveJobPath(cwd, jobId, ".json");
+}
+
+function resolveJobLockFile(cwd, jobId) {
+  return resolveJobPath(cwd, jobId, ".lock");
 }

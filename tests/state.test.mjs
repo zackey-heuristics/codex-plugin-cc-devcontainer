@@ -1,18 +1,110 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  deleteSessionJobs,
+  listJobs,
   loadState,
+  pruneJobsOnDisk,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
-  saveState
+  saveState,
+  writeJobFileForTest,
+  upsertJob
 } from "../plugins/codex/scripts/lib/state.mjs";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const STATE_MODULE_URL = pathToFileURL(path.join(REPO_ROOT, "plugins/codex/scripts/lib/state.mjs")).href;
+
+function spawnNodeScript(script) {
+  return spawn(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: REPO_ROOT,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForFile(filePath, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath)) {
+      return;
+    }
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${filePath}`);
+}
+
+async function waitForCondition(check, description, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = check();
+    if (value) {
+      return value;
+    }
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
+
+function waitForChild(child, label, timeoutMs = 5000) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`${label} timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, timeoutMs);
+
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`${label} exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }
+    });
+  });
+}
+
+function readLockTokenLog(tokenLogFile) {
+  if (!fs.existsSync(tokenLogFile)) {
+    return [];
+  }
+  return fs
+    .readFileSync(tokenLogFile, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const separator = line.indexOf(":");
+      return { label: line.slice(0, separator), token: line.slice(separator + 1) };
+    });
+}
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -58,34 +150,24 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
   }
 });
 
-test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+test("upsertJob is safe under concurrent updates across distinct jobs", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
-  const jobs = Array.from({ length: 51 }, (_, index) => {
-    const jobId = `job-${index}`;
-    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
-    const logFile = resolveJobLogFile(workspace, jobId);
-    const jobFile = resolveJobFile(workspace, jobId);
-    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
-    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
-    return {
-      id: jobId,
-      status: "completed",
-      logFile,
-      updatedAt,
-      createdAt: updatedAt
-    };
-  });
+  upsertJob(workspace, { id: "A", status: "running", phase: "starting" });
+  upsertJob(workspace, { id: "B", status: "running", phase: "starting" });
+  upsertJob(workspace, { id: "A", status: "completed", phase: "done", result: "a-final" });
 
   fs.writeFileSync(
     stateFile,
     `${JSON.stringify(
       {
         version: 1,
-        config: { stopReviewGate: false },
-        jobs
+        config: {},
+        jobs: [
+          { id: "A", status: "running", phase: "running", updatedAt: "2026-01-01T00:00:00.000Z" },
+          { id: "B", status: "verifying", phase: "verifying", updatedAt: "2026-01-01T00:00:01.000Z" }
+        ]
       },
       null,
       2
@@ -93,25 +175,299 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
     "utf8"
   );
 
-  saveState(workspace, {
+  upsertJob(workspace, { id: "B", status: "completed", phase: "done", result: "b-final" });
+
+  const jobsById = new Map(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobsById.get("A")?.status, "completed");
+  assert.equal(jobsById.get("A")?.result, "a-final");
+  assert.equal(jobsById.get("B")?.status, "completed");
+  assert.equal(jobsById.get("B")?.result, "b-final");
+});
+
+test("upsertJob rejects unsafe job ids before touching the jobs directory", () => {
+  const workspace = makeTempDir();
+  const jobsDir = path.join(resolveStateDir(workspace), "jobs");
+
+  assert.throws(() => {
+    upsertJob(workspace, { id: "../escape", status: "running", phase: "starting" });
+  }, /Invalid job id/);
+  assert.equal(fs.existsSync(jobsDir), false);
+});
+
+test("acquireJobLock publishes the lock atomically (no empty-file window)", () => {
+  const workspace = makeTempDir();
+  const jobId = "atomic-publish";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const lockFileName = path.basename(lockPath);
+  const sleepView = new Int32Array(new SharedArrayBuffer(4));
+  const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalReadFileSync = fs.readFileSync;
+  const originalRenameSync = fs.renameSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  const lockFds = new Set();
+  const observations = [];
+  let secondAcquirerRan = false;
+  let activeJobWrites = 0;
+  let maxActiveJobWrites = 0;
+
+  const isLockPublishPath = (filePath) => {
+    const resolved = path.resolve(String(filePath));
+    const baseName = path.basename(resolved);
+    return (
+      resolved === path.resolve(lockPath) ||
+      (path.dirname(resolved) === jobsDir && baseName.startsWith(`.${lockFileName}.`) && baseName.endsWith(".tmp"))
+    );
+  };
+
+  try {
+    fs.openSync = function (...args) {
+      const fd = originalOpenSync.apply(fs, args);
+      if (isLockPublishPath(args[0]) && (Number(args[1]) & fs.constants.O_EXCL) !== 0) {
+        lockFds.add(fd);
+      }
+      return fd;
+    };
+
+    fs.closeSync = function (fd) {
+      lockFds.delete(fd);
+      return originalCloseSync.apply(fs, arguments);
+    };
+
+    fs.renameSync = function (...args) {
+      if (path.resolve(String(args[1])) === path.resolve(jobFile)) {
+        activeJobWrites += 1;
+        maxActiveJobWrites = Math.max(maxActiveJobWrites, activeJobWrites);
+        try {
+          sleepSync(2);
+          return originalRenameSync.apply(fs, args);
+        } finally {
+          activeJobWrites -= 1;
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    fs.writeFileSync = function (...args) {
+      if (typeof args[0] === "number" && lockFds.has(args[0]) && !secondAcquirerRan) {
+        secondAcquirerRan = true;
+        sleepSync(5);
+        if (fs.existsSync(lockPath)) {
+          const raw = originalReadFileSync.apply(fs, [lockPath, "utf8"]);
+          assert.notEqual(raw, "", "lockPath must never be published as an empty file");
+          const lock = JSON.parse(raw);
+          assert.equal(typeof lock.token, "string");
+          observations.push("parsed");
+        } else {
+          observations.push("missing");
+        }
+        upsertJob(workspace, { id: jobId, status: "running", phase: "second" });
+      }
+      return originalWriteFileSync.apply(fs, args);
+    };
+
+    upsertJob(workspace, { id: jobId, status: "running", phase: "first" });
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.renameSync = originalRenameSync;
+    fs.writeFileSync = originalWriteFileSync;
+  }
+
+  assert.equal(secondAcquirerRan, true);
+  assert.deepEqual(observations, ["missing"]);
+  assert.equal(maxActiveJobWrites, 1);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "first");
+});
+
+test("upsertJob recovers when only a recent releasing side file remains", () => {
+  const workspace = makeTempDir();
+  const jobId = "orphan-releasing-lock";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const sidePath = `${lockPath}.releasing.test-token.${process.hrtime.bigint().toString(36)}`;
+
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(sidePath, "orphan releasing side file\n", "utf8");
+  fs.utimesSync(sidePath, new Date(), new Date());
+
+  const startedAt = Date.now();
+  const job = upsertJob(workspace, { id: jobId, status: "running", phase: "created" });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(job.id, jobId);
+  assert.equal(job.phase, "created");
+  assert.equal(elapsedMs < 500, true, `upsertJob took ${elapsedMs}ms`);
+  assert.equal(fs.existsSync(sidePath), false);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "created");
+});
+
+test("upsertJob still blocks on a recent stealing side file without a lock", () => {
+  const workspace = makeTempDir();
+  const jobId = "orphan-stealing-lock";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const sidePath = `${lockPath}.stealing.test-token.${process.hrtime.bigint().toString(36)}`;
+  const originalAtomicsWait = Atomics.wait;
+
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(sidePath, "in-progress stealing side file\n", "utf8");
+  fs.utimesSync(sidePath, new Date(), new Date());
+
+  try {
+    Atomics.wait = () => "timed-out";
+    const startedAt = Date.now();
+    assert.throws(
+      () => {
+        upsertJob(workspace, { id: jobId, status: "running", phase: "blocked" });
+      },
+      (error) => {
+        assert.equal(error?.name, "JobLockTimeoutError");
+        return true;
+      }
+    );
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(elapsedMs < 500, true, `upsertJob took ${elapsedMs}ms`);
+    assert.equal(fs.existsSync(sidePath), true);
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+  }
+
+  fs.unlinkSync(sidePath);
+  const job = upsertJob(workspace, { id: jobId, status: "running", phase: "unblocked" });
+
+  assert.equal(job.id, jobId);
+  assert.equal(job.phase, "unblocked");
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "unblocked");
+});
+
+test("loadState migrates legacy state.json jobs[] into per-job files", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const updatedAt = "2026-01-01T00:01:00.000Z";
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(
+    stateFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: {},
+        jobs: [
+          { id: "legacy-1", status: "completed", createdAt, updatedAt },
+          { id: "../escape", status: "completed", createdAt, updatedAt }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const originalStderrWrite = process.stderr.write;
+  let stderr = "";
+  process.stderr.write = (chunk) => {
+    stderr += String(chunk);
+    return true;
+  };
+  let jobs;
+  try {
+    jobs = listJobs(workspace);
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].id, "legacy-1");
+  assert.match(stderr, /Skipping legacy job "\.\.\/escape": Invalid job id/);
+  const jobFile = resolveJobFile(workspace, "legacy-1");
+  const jobsDir = path.dirname(jobFile);
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.equal(fs.existsSync(path.join(jobsDir, "..", "escape.json")), false);
+  assert.equal(fs.statSync(jobFile).size > 0, true);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).id, "legacy-1");
+  assert.deepEqual(
+    fs.readdirSync(jobsDir).filter((entry) => entry.endsWith(".tmp")),
+    []
+  );
+
+  saveState(workspace, loadState(workspace));
+  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.deepEqual(savedState, {
     version: 1,
-    config: { stopReviewGate: false },
-    jobs
+    config: {
+      stopReviewGate: false,
+      reviewSubagentsEnabled: false
+    }
   });
+});
+
+test("loadState propagates legacy job migration filesystem errors", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(jobsDir, "not a directory\n", "utf8");
+  fs.writeFileSync(
+    stateFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: {},
+        jobs: [
+          {
+            id: "legacy-blocked",
+            status: "completed",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  assert.throws(() => loadState(workspace), /EEXIST|ENOTDIR/);
+  assert.equal(Array.isArray(JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs), true);
+});
+
+test("upsertJob prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+  const workspace = makeTempDir();
+
+  for (let index = 0; index < 51; index += 1) {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    upsertJob(workspace, {
+      id: jobId,
+      status: "completed",
+      logFile,
+      updatedAt,
+      createdAt: updatedAt
+    });
+  }
 
   const prunedJobFile = resolveJobFile(workspace, "job-0");
   const prunedLogFile = resolveJobLogFile(workspace, "job-0");
   const retainedJobFile = resolveJobFile(workspace, "job-50");
   const retainedLogFile = resolveJobLogFile(workspace, "job-50");
   const jobsDir = path.dirname(prunedJobFile);
+  const jobs = listJobs(workspace);
 
   assert.equal(fs.existsSync(retainedJobFile), true);
   assert.equal(fs.existsSync(retainedLogFile), true);
-
-  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  assert.equal(savedState.jobs.length, 50);
+  assert.equal(jobs.length, 50);
   assert.deepEqual(
-    savedState.jobs.map((job) => job.id),
+    jobs.map((job) => job.id),
     Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
   );
   assert.deepEqual(
@@ -122,7 +478,1326 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   );
 });
 
-test("saveState retains all recent review jobs beyond the global cap", () => {
+test("pruneJobsOnDisk skips a candidate whose lock cannot be acquired in time and does not throw from upsertJob", async () => {
+  const workspace = makeTempDir();
+  const victimJobId = "job-0";
+  const victimJobFile = resolveJobFile(workspace, victimJobId);
+  const readyFile = path.join(workspace, "held-lock-ready");
+  const continueFile = path.join(workspace, "held-lock-continue");
+
+  for (let index = 0; index < 51; index += 1) {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    writeJobFileForTest(workspace, jobId, {
+      id: jobId,
+      status: "completed",
+      createdAt: updatedAt,
+      updatedAt
+    });
+  }
+
+  const holderProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const victimJobId = ${JSON.stringify(victimJobId)};
+    const victimJobFile = ${JSON.stringify(victimJobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalRenameSync = fs.renameSync;
+    let blocked = false;
+
+    fs.renameSync = function (...args) {
+      if (!blocked && path.resolve(String(args[1])) === path.resolve(victimJobFile)) {
+        blocked = true;
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    upsertJob(workspace, { id: victimJobId, status: "completed", phase: "held" });
+  `);
+  const holderDone = waitForChild(holderProcess, "held lock writer", 15000);
+  const originalAtomicsWait = Atomics.wait;
+  let caughtError = null;
+
+  try {
+    await waitForFile(readyFile);
+    Atomics.wait = () => "timed-out";
+    assert.doesNotThrow(() => {
+      upsertJob(workspace, { id: "unrelated-job", status: "completed", phase: "done" });
+    });
+    assert.equal(fs.existsSync(victimJobFile), true);
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+    const holderResult = await Promise.allSettled([holderDone]);
+    if (!caughtError && holderResult[0].status === "rejected") {
+      caughtError = holderResult[0].reason;
+    }
+  }
+
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  assert.equal(fs.existsSync(victimJobFile), true);
+});
+
+test("pruneJobsOnDisk skips a pruned job when updatedAt changed after the snapshot", () => {
+  const workspace = makeTempDir();
+  const victimJobId = "job-0";
+  const victimJobFile = resolveJobFile(workspace, victimJobId);
+  const victimLogFile = resolveJobLogFile(workspace, victimJobId);
+  const originalReadFileSync = fs.readFileSync;
+  let victimReads = 0;
+
+  for (let index = 0; index < 51; index += 1) {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    writeJobFileForTest(workspace, jobId, {
+      id: jobId,
+      status: "completed",
+      logFile,
+      updatedAt,
+      createdAt: updatedAt
+    });
+  }
+
+  try {
+    fs.readFileSync = (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(victimJobFile)) {
+        victimReads += 1;
+        if (victimReads === 2) {
+          fs.writeFileSync(
+            victimJobFile,
+            `${JSON.stringify(
+              {
+                id: victimJobId,
+                status: "completed",
+                logFile: victimLogFile,
+                createdAt: "2026-01-01T00:00:00.000Z",
+                updatedAt: "2026-01-01T01:00:00.000Z"
+              },
+              null,
+              2
+            )}\n`,
+            "utf8"
+          );
+        }
+      }
+      return originalReadFileSync.apply(fs, args);
+    };
+
+    pruneJobsOnDisk(workspace);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(fs.existsSync(victimJobFile), true);
+  assert.equal(fs.existsSync(victimLogFile), true);
+  assert.equal(JSON.parse(fs.readFileSync(victimJobFile, "utf8")).updatedAt, "2026-01-01T01:00:00.000Z");
+});
+
+test("pruneJobsOnDisk does not delete a job whose file is replaced after the freshness re-read", async () => {
+  const workspace = makeTempDir();
+  const victimJobId = "job-0";
+  const victimJobFile = resolveJobFile(workspace, victimJobId);
+  const readyFile = path.join(workspace, "prune-ready");
+  const continueFile = path.join(workspace, "prune-continue");
+
+  for (let index = 0; index < 51; index += 1) {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    writeJobFileForTest(workspace, jobId, {
+      id: jobId,
+      status: "completed",
+      logFile,
+      updatedAt,
+      createdAt: updatedAt
+    });
+  }
+
+  const pruneProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const victimJobFile = ${JSON.stringify(victimJobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalUnlinkSync = fs.unlinkSync;
+
+    fs.unlinkSync = (...args) => {
+      if (path.resolve(String(args[0])) === path.resolve(victimJobFile)) {
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalUnlinkSync.apply(fs, args);
+    };
+
+    const { pruneJobsOnDisk } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    pruneJobsOnDisk(workspace);
+  `);
+  const pruneDone = waitForChild(pruneProcess, "prune process");
+
+  try {
+    await waitForFile(readyFile);
+    const writerProcess = spawnNodeScript(`
+      import fs from "node:fs";
+      const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+      fs.writeFileSync(${JSON.stringify(path.join(workspace, "writer-started"))}, "started\\n", "utf8");
+      upsertJob(${JSON.stringify(workspace)}, {
+        id: ${JSON.stringify(victimJobId)},
+        status: "completed",
+        phase: "fresh",
+        result: "fresh"
+      });
+    `);
+    const writerDone = waitForChild(writerProcess, "fresh writer");
+    await waitForFile(path.join(workspace, "writer-started"));
+    await sleep(200);
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+
+    await pruneDone;
+    await writerDone;
+  } finally {
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+  }
+
+  assert.equal(fs.existsSync(victimJobFile), true);
+  const stored = JSON.parse(fs.readFileSync(victimJobFile, "utf8"));
+  assert.equal(stored.phase, "fresh");
+  assert.equal(stored.result, "fresh");
+});
+
+test("pruneJobsOnDisk never prunes running jobs under cap pressure", () => {
+  const workspace = makeTempDir();
+  const runningJobFile = resolveJobFile(workspace, "job-running");
+  const runningLogFile = resolveJobLogFile(workspace, "job-running");
+
+  fs.writeFileSync(runningLogFile, "running\n", "utf8");
+  writeJobFileForTest(workspace, "job-running", {
+    id: "job-running",
+    status: "running",
+    phase: "working",
+    pid: 12345,
+    logFile: runningLogFile,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  for (let index = 0; index < 50; index += 1) {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index + 1, 0)).toISOString();
+    writeJobFileForTest(workspace, jobId, {
+      id: jobId,
+      status: "completed",
+      createdAt: updatedAt,
+      updatedAt
+    });
+  }
+
+  pruneJobsOnDisk(workspace);
+
+  assert.equal(fs.existsSync(runningJobFile), true);
+  assert.equal(fs.existsSync(runningLogFile), true);
+  assert.equal(JSON.parse(fs.readFileSync(runningJobFile, "utf8")).status, "running");
+});
+
+test("deleteSessionJobs removes only matching session jobs and respects the per-job lock", () => {
+  const workspace = makeTempDir();
+  const sessionA = "session-a";
+  const sessionB = "session-b";
+  const insideCustomLogFile = path.join(resolveStateDir(workspace), "custom-session-a.log");
+  const outsideLogFile = path.join(makeTempDir(), "outside-session-a.log");
+  const sessionAInsideJobFile = resolveJobFile(workspace, "session-a-inside");
+  const sessionAOutsideJobFile = resolveJobFile(workspace, "session-a-outside");
+  const sessionBJobFile = resolveJobFile(workspace, "session-b-job");
+  const sessionAInsideSiblingLogFile = resolveJobLogFile(workspace, "session-a-inside");
+  const sessionAOutsideSiblingLogFile = resolveJobLogFile(workspace, "session-a-outside");
+  const sessionBSiblingLogFile = resolveJobLogFile(workspace, "session-b-job");
+
+  fs.writeFileSync(sessionAInsideSiblingLogFile, "session a sibling\n", "utf8");
+  fs.writeFileSync(sessionAOutsideSiblingLogFile, "session a outside sibling\n", "utf8");
+  fs.writeFileSync(sessionBSiblingLogFile, "session b sibling\n", "utf8");
+  fs.writeFileSync(insideCustomLogFile, "session a custom\n", "utf8");
+  fs.writeFileSync(outsideLogFile, "outside custom\n", "utf8");
+
+  writeJobFileForTest(workspace, "session-a-inside", {
+    id: "session-a-inside",
+    sessionId: sessionA,
+    status: "completed",
+    logFile: insideCustomLogFile,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  writeJobFileForTest(workspace, "session-a-outside", {
+    id: "session-a-outside",
+    sessionId: sessionA,
+    status: "completed",
+    logFile: outsideLogFile,
+    createdAt: "2026-01-01T00:01:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z"
+  });
+  writeJobFileForTest(workspace, "session-b-job", {
+    id: "session-b-job",
+    sessionId: sessionB,
+    status: "completed",
+    logFile: sessionBSiblingLogFile,
+    createdAt: "2026-01-01T00:02:00.000Z",
+    updatedAt: "2026-01-01T00:02:00.000Z"
+  });
+
+  const deletedIds = deleteSessionJobs(workspace, sessionA);
+
+  assert.deepEqual(deletedIds.sort(), ["session-a-inside", "session-a-outside"]);
+  assert.equal(fs.existsSync(sessionAInsideJobFile), false);
+  assert.equal(fs.existsSync(sessionAOutsideJobFile), false);
+  assert.equal(fs.existsSync(sessionAInsideSiblingLogFile), false);
+  assert.equal(fs.existsSync(sessionAOutsideSiblingLogFile), false);
+  assert.equal(fs.existsSync(insideCustomLogFile), false);
+  assert.equal(fs.existsSync(outsideLogFile), true);
+  assert.equal(fs.existsSync(sessionBJobFile), true);
+  assert.equal(fs.existsSync(sessionBSiblingLogFile), true);
+});
+
+test("deleteSessionJobs with onMatchUnderLock terminates and cancels active jobs when the sessionId still matches", () => {
+  const workspace = makeTempDir();
+  const sessionA = "session-a";
+  const sessionB = "session-b";
+  const callbackIds = [];
+
+  writeJobFileForTest(workspace, "session-a-running", {
+    id: "session-a-running",
+    sessionId: sessionA,
+    status: "running",
+    pid: 111,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  writeJobFileForTest(workspace, "session-a-queued", {
+    id: "session-a-queued",
+    sessionId: sessionA,
+    status: "queued",
+    pid: 222,
+    createdAt: "2026-01-01T00:01:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z"
+  });
+  writeJobFileForTest(workspace, "session-b-running", {
+    id: "session-b-running",
+    sessionId: sessionB,
+    status: "running",
+    pid: 333,
+    createdAt: "2026-01-01T00:02:00.000Z",
+    updatedAt: "2026-01-01T00:02:00.000Z"
+  });
+
+  const deletedIds = deleteSessionJobs(workspace, sessionA, {
+    onMatchUnderLock: (job) => {
+      callbackIds.push(job.id);
+    }
+  });
+
+  assert.deepEqual(deletedIds.sort(), ["session-a-queued", "session-a-running"]);
+  assert.deepEqual(callbackIds.sort(), ["session-a-queued", "session-a-running"]);
+  assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspace, "session-a-running"), "utf8")).status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspace, "session-a-queued"), "utf8")).status, "cancelled");
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "session-b-running")), true);
+});
+
+test("deleteSessionJobs converts active session jobs to terminal cancelled records", () => {
+  const workspace = makeTempDir();
+  const sessionId = "session-active";
+  const jobId = "active-session-job";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const logFile = resolveJobLogFile(workspace, jobId);
+
+  fs.writeFileSync(logFile, "active log\n", "utf8");
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    sessionId,
+    status: "running",
+    phase: "working",
+    pid: 12345,
+    logFile,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  assert.deepEqual(deleteSessionJobs(workspace, sessionId), [jobId]);
+
+  const cancelled = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.phase, "cancelled");
+  assert.equal(cancelled.pid, null);
+  assert.equal(cancelled.errorMessage, "Cancelled by session end.");
+  assert.equal(cancelled.completedAt, cancelled.cancelledAt);
+  assert.equal(Number.isFinite(Date.parse(cancelled.cancelledAt)), true);
+  assert.equal(fs.existsSync(logFile), true);
+
+  upsertJob(workspace, {
+    id: jobId,
+    sessionId,
+    status: "running",
+    phase: "late-running",
+    pid: 67890
+  });
+
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.phase, "cancelled");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.completedAt, cancelled.completedAt);
+  assert.equal(stored.cancelledAt, cancelled.cancelledAt);
+  assert.equal(stored.errorMessage, "Cancelled by session end.");
+});
+
+test("deleteSessionJobs skips a job whose lock is held by another writer and does not throw", async () => {
+  const workspace = makeTempDir();
+  const sessionId = "session-a";
+  const jobId = "held-delete";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const readyFile = path.join(workspace, "delete-held-lock-ready");
+  const continueFile = path.join(workspace, "delete-held-lock-continue");
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    sessionId,
+    status: "running",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  const holderProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const jobId = ${JSON.stringify(jobId)};
+    const sessionId = ${JSON.stringify(sessionId)};
+    const jobFile = ${JSON.stringify(jobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalRenameSync = fs.renameSync;
+    let blocked = false;
+
+    fs.renameSync = function (...args) {
+      if (!blocked && path.resolve(String(args[1])) === path.resolve(jobFile)) {
+        blocked = true;
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    upsertJob(workspace, { id: jobId, sessionId, status: "running", phase: "held" });
+  `);
+  const holderDone = waitForChild(holderProcess, "delete held lock writer", 15000);
+  const originalAtomicsWait = Atomics.wait;
+  let caughtError = null;
+
+  try {
+    await waitForFile(readyFile);
+    Atomics.wait = () => "timed-out";
+    assert.deepEqual(deleteSessionJobs(workspace, sessionId), []);
+    assert.equal(fs.existsSync(jobFile), true);
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+    const holderResult = await Promise.allSettled([holderDone]);
+    if (!caughtError && holderResult[0].status === "rejected") {
+      caughtError = holderResult[0].reason;
+    }
+  }
+
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  assert.deepEqual(deleteSessionJobs(workspace, sessionId), [jobId]);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).status, "cancelled");
+});
+
+test("deleteSessionJobs skips a job whose sessionId changed after the snapshot", async () => {
+  const workspace = makeTempDir();
+  const sessionA = "session-a";
+  const sessionB = "session-b";
+  const jobId = "handoff-delete";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const logFile = resolveJobLogFile(workspace, jobId);
+  const readyFile = path.join(workspace, "delete-handoff-ready");
+  const continueFile = path.join(workspace, "delete-handoff-continue");
+
+  fs.writeFileSync(logFile, "handoff log\n", "utf8");
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    sessionId: sessionA,
+    status: "running",
+    logFile,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  const writerProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const jobId = ${JSON.stringify(jobId)};
+    const sessionB = ${JSON.stringify(sessionB)};
+    const jobFile = ${JSON.stringify(jobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalRenameSync = fs.renameSync;
+    let blocked = false;
+
+    fs.renameSync = function (...args) {
+      if (!blocked && path.resolve(String(args[1])) === path.resolve(jobFile)) {
+        blocked = true;
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    upsertJob(workspace, { id: jobId, sessionId: sessionB, status: "running", phase: "handoff" });
+  `);
+  const writerDone = waitForChild(writerProcess, "session handoff writer", 15000);
+  const originalAtomicsWait = Atomics.wait;
+  let releasedWriter = false;
+  let caughtError = null;
+
+  try {
+    await waitForFile(readyFile);
+    Atomics.wait = (...args) => {
+      if (!releasedWriter) {
+        releasedWriter = true;
+        fs.writeFileSync(continueFile, "continue\n", "utf8");
+      }
+      return originalAtomicsWait.apply(Atomics, args);
+    };
+    assert.deepEqual(deleteSessionJobs(workspace, sessionA), []);
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+    const writerResult = await Promise.allSettled([writerDone]);
+    if (!caughtError && writerResult[0].status === "rejected") {
+      caughtError = writerResult[0].reason;
+    }
+  }
+
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.equal(fs.existsSync(logFile), true);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).sessionId, sessionB);
+});
+
+test("deleteSessionJobs with onMatchUnderLock does NOT call the callback when sessionId changed under the lock", async () => {
+  const workspace = makeTempDir();
+  const sessionA = "session-a";
+  const sessionB = "session-b";
+  const jobId = "handoff-delete-callback";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const readyFile = path.join(workspace, "delete-handoff-callback-ready");
+  const continueFile = path.join(workspace, "delete-handoff-callback-continue");
+  const callbackIds = [];
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    sessionId: sessionA,
+    status: "running",
+    pid: 444,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  const writerProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const jobId = ${JSON.stringify(jobId)};
+    const sessionB = ${JSON.stringify(sessionB)};
+    const jobFile = ${JSON.stringify(jobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalRenameSync = fs.renameSync;
+    let blocked = false;
+
+    fs.renameSync = function (...args) {
+      if (!blocked && path.resolve(String(args[1])) === path.resolve(jobFile)) {
+        blocked = true;
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    upsertJob(workspace, { id: jobId, sessionId: sessionB, status: "running", phase: "handoff" });
+  `);
+  const writerDone = waitForChild(writerProcess, "session handoff callback writer", 15000);
+  const originalAtomicsWait = Atomics.wait;
+  let releasedWriter = false;
+  let caughtError = null;
+
+  try {
+    await waitForFile(readyFile);
+    Atomics.wait = (...args) => {
+      if (!releasedWriter) {
+        releasedWriter = true;
+        fs.writeFileSync(continueFile, "continue\n", "utf8");
+      }
+      return originalAtomicsWait.apply(Atomics, args);
+    };
+    assert.deepEqual(
+      deleteSessionJobs(workspace, sessionA, {
+        onMatchUnderLock: (job) => {
+          callbackIds.push(job.id);
+        }
+      }),
+      []
+    );
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    Atomics.wait = originalAtomicsWait;
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+    const writerResult = await Promise.allSettled([writerDone]);
+    if (!caughtError && writerResult[0].status === "rejected") {
+      caughtError = writerResult[0].reason;
+    }
+  }
+
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  assert.deepEqual(callbackIds, []);
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).sessionId, sessionB);
+});
+
+test("upsertJob keeps a completed job terminal when a running update arrives late", () => {
+  const workspace = makeTempDir();
+  const jobId = "terminal-completed";
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    pid: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+    completedAt: "2026-01-01T00:01:00.000Z",
+    result: { ok: true },
+    rendered: "done"
+  });
+
+  upsertJob(workspace, { id: jobId, status: "running", phase: "working", pid: 12345 });
+
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.phase, "done");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.completedAt, "2026-01-01T00:01:00.000Z");
+  assert.deepEqual(stored.result, { ok: true });
+  assert.equal(stored.rendered, "done");
+});
+
+test("upsertJob preserves a terminal state written by another writer between the initial read and the write", async () => {
+  const workspace = makeTempDir();
+  const jobId = "stale-writer-terminal";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const readyFile = path.join(workspace, "upsert-ready");
+  const continueFile = path.join(workspace, "upsert-continue");
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "working",
+    pid: 111,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  const staleWriterProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const jobFile = ${JSON.stringify(jobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalRenameSync = fs.renameSync;
+
+    fs.renameSync = (...args) => {
+      if (path.resolve(String(args[1])) === path.resolve(jobFile)) {
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(25);
+        }
+      }
+      return originalRenameSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    upsertJob(workspace, { id: ${JSON.stringify(jobId)}, status: "running", phase: "late-running", pid: 222 });
+  `);
+  const staleWriterDone = waitForChild(staleWriterProcess, "stale writer");
+
+  try {
+    await waitForFile(readyFile);
+    const terminalWriterProcess = spawnNodeScript(`
+      import fs from "node:fs";
+      const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+      fs.writeFileSync(${JSON.stringify(path.join(workspace, "terminal-writer-started"))}, "started\\n", "utf8");
+      upsertJob(${JSON.stringify(workspace)}, {
+        id: ${JSON.stringify(jobId)},
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        completedAt: "2026-01-01T00:01:00.000Z",
+        errorMessage: "Cancelled by user."
+      });
+    `);
+    const terminalWriterDone = waitForChild(terminalWriterProcess, "terminal writer");
+    await waitForFile(path.join(workspace, "terminal-writer-started"));
+    await sleep(200);
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+
+    await staleWriterDone;
+    await terminalWriterDone;
+  } finally {
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+  }
+
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.phase, "cancelled");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.completedAt, "2026-01-01T00:01:00.000Z");
+  assert.equal(stored.errorMessage, "Cancelled by user.");
+});
+
+test("upsertJob aborts before writing when its held lock token was stolen", async () => {
+  const workspace = makeTempDir();
+  const jobId = "stolen-lock-write";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const lockPath = path.join(path.dirname(jobFile), `${jobId}.lock`);
+  const readyFile = path.join(workspace, "stolen-lock-ready");
+  const continueFile = path.join(workspace, "stolen-lock-continue");
+  const errorFile = path.join(workspace, "stolen-lock-error");
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "initial",
+    pid: 111,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  const writerProcess = spawnNodeScript(`
+    import fs from "node:fs";
+    import path from "node:path";
+
+    const workspace = ${JSON.stringify(workspace)};
+    const jobId = ${JSON.stringify(jobId)};
+    const jobFile = ${JSON.stringify(jobFile)};
+    const readyFile = ${JSON.stringify(readyFile)};
+    const continueFile = ${JSON.stringify(continueFile)};
+    const errorFile = ${JSON.stringify(errorFile)};
+    const sleepView = new Int32Array(new SharedArrayBuffer(4));
+    const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+    const originalReadFileSync = fs.readFileSync;
+    let blocked = false;
+
+    fs.readFileSync = function (...args) {
+      if (!blocked && path.resolve(String(args[0])) === path.resolve(jobFile)) {
+        blocked = true;
+        fs.writeFileSync(readyFile, "ready\\n", "utf8");
+        while (!fs.existsSync(continueFile)) {
+          sleepSync(10);
+        }
+      }
+      return originalReadFileSync.apply(fs, args);
+    };
+
+    const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+    try {
+      upsertJob(workspace, { id: jobId, status: "running", phase: "stale-write", pid: 222 });
+      fs.writeFileSync(errorFile, "no error\\n", "utf8");
+      process.exitCode = 1;
+    } catch (error) {
+      fs.writeFileSync(errorFile, \`\${error?.name}: \${error?.message}\\n\`, "utf8");
+      if (error?.name !== "JobLockStolenError") {
+        process.exitCode = 1;
+      }
+    }
+  `);
+  const writerDone = waitForChild(writerProcess, "stolen lock writer", 15000);
+
+  try {
+    await waitForFile(readyFile);
+    fs.writeFileSync(
+      lockPath,
+      `${JSON.stringify({
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+        token: "stolen-token"
+      })}\n`,
+      "utf8"
+    );
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+    await writerDone;
+  } finally {
+    fs.writeFileSync(continueFile, "continue\n", "utf8");
+  }
+
+  assert.match(fs.readFileSync(errorFile, "utf8"), /^JobLockStolenError:/);
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(stored.status, "running");
+  assert.equal(stored.phase, "initial");
+  assert.equal(stored.pid, 111);
+});
+
+test("stale-lock recovery is ownership-checked: two stealers cannot end up with overlapping critical sections", async () => {
+  const workspace = makeTempDir();
+  const jobId = "stale-lock-owned";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const lockPath = path.join(path.dirname(jobFile), `${jobId}.lock`);
+  const tokenLogFile = path.join(workspace, "lock-tokens.log");
+  const goFile = path.join(workspace, "stale-steal-go");
+  const aStaleReadyFile = path.join(workspace, "A-stale-ready");
+  const bStaleReadyFile = path.join(workspace, "B-stale-ready");
+  const aBeforeWriteFile = path.join(workspace, "A-before-write");
+  const bBeforeWriteFile = path.join(workspace, "B-before-write");
+  const aContinueFile = path.join(workspace, "A-continue");
+  const bContinueFile = path.join(workspace, "B-continue");
+  const bStealRenamedFile = path.join(workspace, "B-steal-renamed");
+  const staleHolder = spawnNodeScript("");
+  const stalePid = staleHolder.pid;
+  await waitForChild(staleHolder, "stale holder pid probe");
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "initial",
+    pid: stalePid,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  fs.writeFileSync(
+    lockPath,
+    `${JSON.stringify({
+      pid: stalePid,
+      acquiredAt: new Date(Date.now() - 61_000).toISOString(),
+      token: "stale-token"
+    })}\n`,
+    "utf8"
+  );
+
+  const workerScript = (label, patch) => {
+    const staleReadyFile = label === "A" ? aStaleReadyFile : bStaleReadyFile;
+    return `
+      import fs from "node:fs";
+      import path from "node:path";
+
+      const workspace = ${JSON.stringify(workspace)};
+      const jobId = ${JSON.stringify(jobId)};
+      const jobFile = ${JSON.stringify(jobFile)};
+      const lockPath = ${JSON.stringify(lockPath)};
+      const tokenLogFile = ${JSON.stringify(tokenLogFile)};
+      const staleReadyFile = ${JSON.stringify(staleReadyFile)};
+      const goFile = ${JSON.stringify(goFile)};
+      const aBeforeWriteFile = ${JSON.stringify(aBeforeWriteFile)};
+      const bBeforeWriteFile = ${JSON.stringify(bBeforeWriteFile)};
+      const aContinueFile = ${JSON.stringify(aContinueFile)};
+      const bContinueFile = ${JSON.stringify(bContinueFile)};
+      const bStealRenamedFile = ${JSON.stringify(bStealRenamedFile)};
+      const label = ${JSON.stringify(label)};
+      const sleepView = new Int32Array(new SharedArrayBuffer(4));
+      const originalAtomicsWait = Atomics.wait;
+      const sleepSync = (ms) => originalAtomicsWait(sleepView, 0, 0, ms);
+      Atomics.wait = () => "timed-out";
+
+      const originalReadFileSync = fs.readFileSync;
+      const originalWriteFileSync = fs.writeFileSync;
+      const originalLinkSync = fs.linkSync;
+      const originalRenameSync = fs.renameSync;
+      const resolvedLockPath = path.resolve(lockPath);
+      const resolvedJobFile = path.resolve(jobFile);
+      const lockFileName = path.basename(lockPath);
+
+      fs.linkSync = function (...args) {
+        const result = originalLinkSync.apply(fs, args);
+        const sourceName = path.basename(path.resolve(String(args[0])));
+        if (
+          path.resolve(String(args[1])) === resolvedLockPath &&
+          sourceName.startsWith(\`.\${lockFileName}.\`) &&
+          sourceName.endsWith(".tmp")
+        ) {
+          const lock = JSON.parse(originalReadFileSync.apply(fs, [args[0], "utf8"]));
+          fs.appendFileSync(tokenLogFile, \`\${label}:\${lock.token}\\n\`, "utf8");
+        }
+        return result;
+      };
+
+      let staleRenameSeen = false;
+      let jobWriteBlocked = false;
+      fs.renameSync = function (...args) {
+        const from = path.resolve(String(args[0]));
+        const to = path.resolve(String(args[1]));
+        if (!staleRenameSeen && from === resolvedLockPath && String(args[1]).includes(".stealing.")) {
+          staleRenameSeen = true;
+          originalWriteFileSync(staleReadyFile, "ready\\n", "utf8");
+          while (!fs.existsSync(goFile)) {
+            sleepSync(10);
+          }
+          if (label === "B") {
+            while (!fs.existsSync(aBeforeWriteFile)) {
+              sleepSync(10);
+            }
+          }
+          try {
+            return originalRenameSync.apply(fs, args);
+          } finally {
+            if (label === "B") {
+              originalWriteFileSync(bStealRenamedFile, "renamed\\n", "utf8");
+            }
+            Atomics.wait = originalAtomicsWait;
+          }
+        }
+
+        if (!jobWriteBlocked && to === resolvedJobFile) {
+          jobWriteBlocked = true;
+          const readyFile = label === "A" ? aBeforeWriteFile : bBeforeWriteFile;
+          const continueFile = label === "A" ? aContinueFile : bContinueFile;
+          originalWriteFileSync(readyFile, "ready\\n", "utf8");
+          while (!fs.existsSync(continueFile)) {
+            sleepSync(10);
+          }
+        }
+
+        return originalRenameSync.apply(fs, args);
+      };
+
+      const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+      upsertJob(workspace, ${JSON.stringify(patch)});
+    `;
+  };
+
+  const firstWriter = spawnNodeScript(
+    workerScript("A", {
+      id: jobId,
+      status: "completed",
+      phase: "done",
+      pid: null,
+      completedAt: "2026-01-01T00:01:00.000Z",
+      result: { ok: true }
+    })
+  );
+  const secondWriter = spawnNodeScript(
+    workerScript("B", {
+      id: jobId,
+      status: "running",
+      phase: "late-running",
+      pid: 98765,
+      note: "late writer ran"
+    })
+  );
+  const firstDone = waitForChild(firstWriter, "first stale stealer", 15000);
+  const secondDone = waitForChild(secondWriter, "second stale stealer", 15000);
+  let caughtError = null;
+
+  try {
+    await waitForFile(aStaleReadyFile);
+    await waitForFile(bStaleReadyFile);
+    fs.writeFileSync(goFile, "go\n", "utf8");
+    await waitForFile(aBeforeWriteFile);
+    await waitForFile(bStealRenamedFile);
+
+    const firstTokenEntries = await waitForCondition(() => {
+      const entries = readLockTokenLog(tokenLogFile);
+      return entries.length === 1 ? entries : null;
+    }, "exactly one live token while the first writer is blocked");
+    const firstToken = firstTokenEntries[0].token;
+    await waitForCondition(() => {
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+        return lock.token === firstToken ? lock : null;
+      } catch {
+        return null;
+      }
+    }, "the first writer lock to be restored after the second steal attempt");
+
+    await sleep(300);
+    assert.equal(
+      fs.existsSync(bBeforeWriteFile),
+      false,
+      "second writer entered the critical section while the first writer lock was live"
+    );
+    assert.deepEqual(
+      readLockTokenLog(tokenLogFile).map((entry) => entry.token),
+      [firstToken],
+      "only one ownership token should appear while the first writer is blocked"
+    );
+
+    fs.writeFileSync(aContinueFile, "continue\n", "utf8");
+    await firstDone;
+    await waitForFile(bBeforeWriteFile, 10000);
+    fs.writeFileSync(bContinueFile, "continue\n", "utf8");
+    await secondDone;
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    fs.writeFileSync(goFile, "go\n", "utf8");
+    fs.writeFileSync(aContinueFile, "continue\n", "utf8");
+    fs.writeFileSync(bContinueFile, "continue\n", "utf8");
+    const childResults = await Promise.allSettled([firstDone, secondDone]);
+    if (!caughtError) {
+      const rejected = childResults.find((result) => result.status === "rejected");
+      if (rejected) {
+        caughtError = rejected.reason;
+      }
+    }
+  }
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.phase, "done");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.completedAt, "2026-01-01T00:01:00.000Z");
+  assert.deepEqual(stored.result, { ok: true });
+  assert.equal(stored.note, "late writer ran");
+});
+
+test("stealStaleJobLock does not unlink a fresh lock observed at the side path", async () => {
+  const workspace = makeTempDir();
+  const jobId = "stale-lock-restore-eexist";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const jobsDir = path.dirname(jobFile);
+  const lockPath = path.join(jobsDir, `${jobId}.lock`);
+  const goFile = path.join(workspace, "restore-go");
+  const activeFile = path.join(workspace, "active-critical");
+  const overlapFile = path.join(workspace, "critical-overlap");
+  const aStaleReadyFile = path.join(workspace, "A-restore-stale-ready");
+  const bStaleReadyFile = path.join(workspace, "B-restore-stale-ready");
+  const aBeforeWriteFile = path.join(workspace, "A-restore-before-write");
+  const bBeforeWriteFile = path.join(workspace, "B-restore-before-write");
+  const bBeforeRestoreFile = path.join(workspace, "B-before-restore");
+  const bRestoreAttemptedFile = path.join(workspace, "B-restore-attempted");
+  const freshLockReadyFile = path.join(workspace, "fresh-lock-ready");
+  const freshLockContinueFile = path.join(workspace, "fresh-lock-continue");
+  const aContinueFile = path.join(workspace, "A-restore-continue");
+  const bContinueFile = path.join(workspace, "B-restore-continue");
+  const staleHolder = spawnNodeScript("");
+  const stalePid = staleHolder.pid;
+  await waitForChild(staleHolder, "stale holder pid probe");
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "initial",
+    pid: stalePid,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  fs.writeFileSync(
+    lockPath,
+    `${JSON.stringify({
+      pid: stalePid,
+      acquiredAt: new Date(Date.now() - 61_000).toISOString(),
+      token: "stale-token"
+    })}\n`,
+    "utf8"
+  );
+
+  const sideEntries = () =>
+    fs
+      .readdirSync(jobsDir)
+      .filter((entry) => entry.includes(".lock.stealing.") || entry.includes(".lock.releasing."))
+      .sort();
+
+  const workerScript = (label, patch) => {
+    const staleReadyFile = label === "A" ? aStaleReadyFile : bStaleReadyFile;
+    const beforeWriteFile = label === "A" ? aBeforeWriteFile : bBeforeWriteFile;
+    const continueFile = label === "A" ? aContinueFile : bContinueFile;
+    return `
+      import fs from "node:fs";
+      import path from "node:path";
+
+      const workspace = ${JSON.stringify(workspace)};
+      const jobFile = ${JSON.stringify(jobFile)};
+      const lockPath = ${JSON.stringify(lockPath)};
+      const goFile = ${JSON.stringify(goFile)};
+      const staleReadyFile = ${JSON.stringify(staleReadyFile)};
+      const beforeWriteFile = ${JSON.stringify(beforeWriteFile)};
+      const continueFile = ${JSON.stringify(continueFile)};
+      const aBeforeWriteFile = ${JSON.stringify(aBeforeWriteFile)};
+      const bBeforeRestoreFile = ${JSON.stringify(bBeforeRestoreFile)};
+      const bRestoreAttemptedFile = ${JSON.stringify(bRestoreAttemptedFile)};
+      const freshLockReadyFile = ${JSON.stringify(freshLockReadyFile)};
+      const activeFile = ${JSON.stringify(activeFile)};
+      const overlapFile = ${JSON.stringify(overlapFile)};
+      const label = ${JSON.stringify(label)};
+      const sleepView = new Int32Array(new SharedArrayBuffer(4));
+      const originalAtomicsWait = Atomics.wait;
+      const sleepSync = (ms) => originalAtomicsWait(sleepView, 0, 0, ms);
+      Atomics.wait = () => "timed-out";
+
+      const originalLinkSync = fs.linkSync;
+      const originalRenameSync = fs.renameSync;
+      const originalWriteFileSync = fs.writeFileSync;
+      const originalUnlinkSync = fs.unlinkSync;
+      const resolvedLockPath = path.resolve(lockPath);
+      const resolvedJobFile = path.resolve(jobFile);
+      let staleRenameSeen = false;
+      let jobWriteBlocked = false;
+
+      fs.linkSync = function (...args) {
+        const to = path.resolve(String(args[1]));
+        if (label === "B" && String(args[0]).includes(".stealing.") && to === resolvedLockPath) {
+          originalWriteFileSync(bBeforeRestoreFile, "ready\\n", "utf8");
+          while (!fs.existsSync(freshLockReadyFile)) {
+            sleepSync(10);
+          }
+          try {
+            return originalLinkSync.apply(fs, args);
+          } finally {
+            originalWriteFileSync(bRestoreAttemptedFile, "attempted\\n", "utf8");
+          }
+        }
+
+        return originalLinkSync.apply(fs, args);
+      };
+
+      fs.renameSync = function (...args) {
+        const from = path.resolve(String(args[0]));
+        const to = path.resolve(String(args[1]));
+        if (!staleRenameSeen && from === resolvedLockPath && String(args[1]).includes(".stealing.")) {
+          staleRenameSeen = true;
+          originalWriteFileSync(staleReadyFile, "ready\\n", "utf8");
+          while (!fs.existsSync(goFile)) {
+            sleepSync(10);
+          }
+          if (label === "B") {
+            while (!fs.existsSync(aBeforeWriteFile)) {
+              sleepSync(10);
+            }
+          }
+          try {
+            return originalRenameSync.apply(fs, args);
+          } finally {
+            Atomics.wait = originalAtomicsWait;
+          }
+        }
+
+        if (!jobWriteBlocked && to === resolvedJobFile) {
+          jobWriteBlocked = true;
+          if (fs.existsSync(activeFile)) {
+            originalWriteFileSync(overlapFile, \`\${label}\\n\`, "utf8");
+          }
+          originalWriteFileSync(activeFile, label, "utf8");
+          originalWriteFileSync(beforeWriteFile, "ready\\n", "utf8");
+          while (!fs.existsSync(continueFile)) {
+            sleepSync(10);
+          }
+          try {
+            return originalRenameSync.apply(fs, args);
+          } finally {
+            try {
+              if (fs.existsSync(activeFile) && fs.readFileSync(activeFile, "utf8") === label) {
+                originalUnlinkSync(activeFile);
+              }
+            } catch {}
+          }
+        }
+
+        return originalRenameSync.apply(fs, args);
+      };
+
+      const { upsertJob } = await import(${JSON.stringify(STATE_MODULE_URL)});
+      upsertJob(workspace, ${JSON.stringify(patch)});
+    `;
+  };
+
+  const firstWriter = spawnNodeScript(
+    workerScript("A", {
+      id: jobId,
+      status: "completed",
+      phase: "done",
+      pid: null,
+      completedAt: "2026-01-01T00:01:00.000Z",
+      result: { ok: true }
+    })
+  );
+  const secondWriter = spawnNodeScript(
+    workerScript("B", {
+      id: jobId,
+      status: "running",
+      phase: "late-running",
+      pid: 98765,
+      note: "late writer ran"
+    })
+  );
+  const firstDone = waitForChild(firstWriter, "first restore stealer", 15000);
+  const secondDone = waitForChild(secondWriter, "second restore stealer", 15000);
+  let freshHolderDone = null;
+  let caughtError = null;
+
+  try {
+    await waitForFile(aStaleReadyFile);
+    await waitForFile(bStaleReadyFile);
+    fs.writeFileSync(goFile, "go\n", "utf8");
+    await waitForFile(aBeforeWriteFile);
+    await waitForFile(bBeforeRestoreFile);
+
+    const freshHolder = spawnNodeScript(`
+      import fs from "node:fs";
+      const sleepView = new Int32Array(new SharedArrayBuffer(4));
+      const sleepSync = (ms) => Atomics.wait(sleepView, 0, 0, ms);
+      const lock = { pid: process.pid, acquiredAt: new Date().toISOString(), token: "fresh-lock" };
+      fs.writeFileSync(
+        ${JSON.stringify(lockPath)},
+        \`\${JSON.stringify(lock)}\\n\`,
+        "utf8"
+      );
+      fs.writeFileSync(${JSON.stringify(freshLockReadyFile)}, "ready\\n", "utf8");
+      while (!fs.existsSync(${JSON.stringify(freshLockContinueFile)})) {
+        sleepSync(10);
+      }
+    `);
+    freshHolderDone = waitForChild(freshHolder, "fresh lock holder", 15000);
+    await waitForFile(freshLockReadyFile);
+    await waitForFile(bRestoreAttemptedFile);
+
+    const freshLock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    assert.equal(freshLock.token, "fresh-lock");
+    const orphanedSideEntries = sideEntries();
+    assert.equal(orphanedSideEntries.length, 1);
+    assert.equal(fs.existsSync(bBeforeWriteFile), false);
+    assert.equal(fs.existsSync(overlapFile), false);
+
+    fs.writeFileSync(aContinueFile, "continue\n", "utf8");
+    await firstDone;
+    fs.writeFileSync(freshLockContinueFile, "continue\n", "utf8");
+    await freshHolderDone;
+    fs.unlinkSync(lockPath);
+
+    const oldDate = new Date(Date.now() - 61_000);
+    for (const entry of orphanedSideEntries) {
+      fs.utimesSync(path.join(jobsDir, entry), oldDate, oldDate);
+    }
+    pruneJobsOnDisk(workspace);
+    assert.deepEqual(sideEntries(), []);
+
+    await waitForFile(bBeforeWriteFile, 10000);
+    fs.writeFileSync(bContinueFile, "continue\n", "utf8");
+    await secondDone;
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    fs.writeFileSync(goFile, "go\n", "utf8");
+    fs.writeFileSync(aContinueFile, "continue\n", "utf8");
+    fs.writeFileSync(bContinueFile, "continue\n", "utf8");
+    fs.writeFileSync(freshLockReadyFile, "ready\n", "utf8");
+    fs.writeFileSync(freshLockContinueFile, "continue\n", "utf8");
+    const childResults = await Promise.allSettled([firstDone, secondDone, freshHolderDone].filter(Boolean));
+    if (!caughtError) {
+      const rejected = childResults.find((result) => result.status === "rejected");
+      if (rejected) {
+        caughtError = rejected.reason;
+      }
+    }
+  }
+  if (caughtError) {
+    throw caughtError;
+  }
+
+  assert.equal(fs.existsSync(overlapFile), false);
+  assert.deepEqual(sideEntries(), []);
+});
+
+test("upsertJob keeps the first terminal status and preserves cancellation details", () => {
+  const workspace = makeTempDir();
+  const jobId = "terminal-cancelled";
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:01:00.000Z",
+    completedAt: "2026-01-01T00:01:00.000Z",
+    errorMessage: "Cancelled by user."
+  });
+
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    completedAt: "2026-01-01T00:02:00.000Z",
+    errorMessage: null,
+    result: { ok: true },
+    rendered: "done"
+  });
+
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.phase, "cancelled");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.completedAt, "2026-01-01T00:01:00.000Z");
+  assert.equal(stored.errorMessage, "Cancelled by user.");
+  assert.equal(stored.result, undefined);
+  assert.equal(stored.rendered, undefined);
+});
+
+test("upsertJob retains all recent review jobs beyond the global cap", () => {
   const workspace = makeTempDir();
   const nowMs = Date.now();
   const taskJobs = Array.from({ length: 40 }, (_, index) => {
@@ -147,20 +1822,18 @@ test("saveState retains all recent review jobs beyond the global cap", () => {
     };
   });
 
-  saveState(workspace, {
-    version: 1,
-    config: { stopReviewGate: false },
-    jobs: [...taskJobs, ...reviewJobs]
-  });
+  for (const job of [...taskJobs, ...reviewJobs]) {
+    upsertJob(workspace, job);
+  }
 
-  const loadedJobIds = new Set(loadState(workspace).jobs.map((job) => job.id));
+  const loadedJobIds = new Set(listJobs(workspace).map((job) => job.id));
 
   for (const job of reviewJobs) {
     assert.equal(loadedJobIds.has(job.id), true, `expected ${job.id} to be retained`);
   }
 });
 
-test("saveState caps recent review jobs before applying the global cap to older jobs", () => {
+test("upsertJob caps recent review jobs before applying the global cap to older jobs", () => {
   const workspace = makeTempDir();
   const nowMs = Date.now();
   const maxRecentReviewJobs = 500;
@@ -187,13 +1860,11 @@ test("saveState caps recent review jobs before applying the global cap to older 
     };
   });
 
-  saveState(workspace, {
-    version: 1,
-    config: { stopReviewGate: false },
-    jobs: [...olderNonReviewJobs, ...reviewJobs]
-  });
+  for (const job of [...olderNonReviewJobs, ...reviewJobs]) {
+    upsertJob(workspace, job);
+  }
 
-  const loadedJobs = loadState(workspace).jobs;
+  const loadedJobs = listJobs(workspace);
   const loadedReviewJobs = loadedJobs.filter((job) => job.jobClass === "review");
   const loadedTaskJobs = loadedJobs.filter((job) => job.jobClass === "task");
   const retainedReviewIdsByCreatedAt = [...loadedReviewJobs]
@@ -209,7 +1880,7 @@ test("saveState caps recent review jobs before applying the global cap to older 
   );
 });
 
-test("saveState still caps old review jobs", () => {
+test("upsertJob still caps old review jobs", () => {
   const workspace = makeTempDir();
   const nowMs = Date.now();
   const jobs = Array.from({ length: 51 }, (_, index) => ({
@@ -221,13 +1892,11 @@ test("saveState still caps old review jobs", () => {
     updatedAt: new Date(nowMs - (51 - index) * 1_000).toISOString()
   }));
 
-  saveState(workspace, {
-    version: 1,
-    config: { stopReviewGate: false },
-    jobs
-  });
+  for (const job of jobs) {
+    upsertJob(workspace, job);
+  }
 
-  const loadedJobs = loadState(workspace).jobs;
+  const loadedJobs = listJobs(workspace);
   const loadedJobIds = new Set(loadedJobs.map((job) => job.id));
 
   assert.equal(loadedJobs.length, 50);

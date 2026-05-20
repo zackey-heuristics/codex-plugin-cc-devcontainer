@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "version": "1.0.4-devcontainer-2",
+  "version": "1.0.4-devcontainer-3",
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "zackey-heuristics (fork of OpenAI codex-plugin-cc)"
