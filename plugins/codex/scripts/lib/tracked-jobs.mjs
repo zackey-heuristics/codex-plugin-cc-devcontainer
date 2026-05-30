@@ -1,9 +1,15 @@
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const TRANSIENT_APPEND_ERROR_CODES = new Set(["EACCES", "EBUSY", "EAGAIN", "EPERM", "EMFILE", "ENFILE", "EINTR"]);
+const APPEND_RETRY_DELAYS_MS = [5, 10];
+const appendCircuitOpenByLogFile = new Map();
+
+let appendFileSyncImpl = fs.appendFileSync;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -33,19 +39,135 @@ function normalizeProgressEvent(value) {
   };
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function normalizeAppendError(error) {
+  if (error instanceof Error) {
+    return error;
+  }
+  const normalized = new Error(String(error));
+  if (error && typeof error === "object" && "code" in error) {
+    normalized.code = error.code;
+  }
+  return normalized;
+}
+
+function getErrorCode(error) {
+  return typeof error?.code === "string" && error.code ? error.code : "UNKNOWN";
+}
+
+function isTransientAppendError(error) {
+  return TRANSIENT_APPEND_ERROR_CODES.has(getErrorCode(error));
+}
+
+function unavailableStat(error) {
+  return `unavailable:${getErrorCode(error)}`;
+}
+
+function readStatField(filePath, readField) {
+  try {
+    return String(readField(fs.statSync(filePath)));
+  } catch (error) {
+    return unavailableStat(error);
+  }
+}
+
+function readProcessField(readField) {
+  try {
+    const value = readField();
+    return value == null ? "unavailable:UNKNOWN" : String(value);
+  } catch (error) {
+    return unavailableStat(error);
+  }
+}
+
+function formatMode(mode) {
+  return `0o${mode.toString(8)}`;
+}
+
+function emitAppendFailureDiagnostic(logFile, attempts, error) {
+  const dir = path.dirname(logFile);
+  const code = getErrorCode(error);
+  const parts = [
+    "[codex-companion] log append failed",
+    `code=${code}`,
+    `attempts=${attempts}`,
+    `logFile=${JSON.stringify(logFile)}`,
+    `file.mode=${readStatField(logFile, (stat) => formatMode(stat.mode))}`,
+    `file.uid=${readStatField(logFile, (stat) => stat.uid)}`,
+    `file.gid=${readStatField(logFile, (stat) => stat.gid)}`,
+    `file.size=${readStatField(logFile, (stat) => stat.size)}`,
+    `file.ctimeMtimeGapMs=${readStatField(logFile, (stat) => Math.round(stat.ctimeMs - stat.mtimeMs))}`,
+    `dir.mode=${readStatField(dir, (stat) => formatMode(stat.mode))}`,
+    `dir.uid=${readStatField(dir, (stat) => stat.uid)}`,
+    `dir.gid=${readStatField(dir, (stat) => stat.gid)}`,
+    `process.uid=${readProcessField(() => (typeof process.getuid === "function" ? process.getuid() : null))}`,
+    `process.gid=${readProcessField(() => (typeof process.getgid === "function" ? process.getgid() : null))}`
+  ];
+
+  try {
+    process.stderr.write(`${parts.join("; ")}\n`);
+  } catch {
+    // Diagnostics must never interfere with the task path.
+  }
+}
+
+export function __setAppendFileSyncForTest(fn) {
+  appendFileSyncImpl = fn;
+}
+
+export function __resetAppendFileSyncForTest() {
+  appendFileSyncImpl = fs.appendFileSync;
+}
+
+export function __resetCircuitBreakerForTest() {
+  appendCircuitOpenByLogFile.clear();
+}
+
+export function safeAppendFileSync(logFile, content) {
+  const resolvedLogFile = path.resolve(String(logFile ?? ""));
+  if (appendCircuitOpenByLogFile.has(resolvedLogFile)) {
+    return { ok: false, attempts: 0, error: null, circuitOpen: true };
+  }
+
+  let attempts = 0;
+  let lastError = null;
+  while (attempts < 3) {
+    attempts += 1;
+    try {
+      appendFileSyncImpl(resolvedLogFile, content, "utf8");
+      return { ok: true, attempts, error: null, circuitOpen: false };
+    } catch (error) {
+      lastError = normalizeAppendError(error);
+      if (!isTransientAppendError(lastError) || attempts >= 3) {
+        emitAppendFailureDiagnostic(resolvedLogFile, attempts, lastError);
+        appendCircuitOpenByLogFile.set(resolvedLogFile, true);
+        return { ok: false, attempts, error: lastError, circuitOpen: false };
+      }
+      sleepSync(APPEND_RETRY_DELAYS_MS[attempts - 1] ?? 0);
+    }
+  }
+
+  emitAppendFailureDiagnostic(resolvedLogFile, attempts, lastError);
+  appendCircuitOpenByLogFile.set(resolvedLogFile, true);
+  return { ok: false, attempts, error: lastError, circuitOpen: false };
+}
+
 export function appendLogLine(logFile, message) {
   const normalized = String(message ?? "").trim();
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  safeAppendFileSync(logFile, `[${nowIso()}] ${normalized}\n`);
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  safeAppendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`);
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
