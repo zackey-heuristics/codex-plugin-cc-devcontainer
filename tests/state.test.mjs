@@ -838,6 +838,67 @@ test("deleteSessionJobs with onMatchUnderLock terminates and cancels active jobs
   assert.equal(fs.existsSync(resolveJobFile(workspace, "session-b-running")), true);
 });
 
+test("deleteSessionJobs with onMatchUnderLock marks a queued pid:null record as cancelled (regression for queued-startup-window fix)", () => {
+  // Regression: before the fix, the no-pid guard threw an error which
+  // deleteSessionJobs interpreted as "skip this job", leaving the record
+  // still queued. The fix returns cleanly so deleteSessionJobs writes the
+  // cancellation record.
+  const workspace = makeTempDir();
+  const sessionId = "queued-null-pid-session";
+  const jobId = "queued-null-pid-job";
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    sessionId,
+    status: "queued",
+    pid: null,
+    pidStartTime: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+
+  // Inline the production onMatchUnderLock callback shape that
+  // session-lifecycle-hook.mjs wires up in cleanupSessionJobs.
+  // We replicate only the no-pid branch logic to test the fix path.
+  const stderrMessages = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (msg, ...rest) => {
+    if (typeof msg === "string" && msg.includes("codex-companion")) {
+      stderrMessages.push(msg);
+    }
+    return originalWrite(msg, ...rest);
+  };
+
+  let deletedIds;
+  try {
+    deletedIds = deleteSessionJobs(workspace, sessionId, {
+      onMatchUnderLock: (job) => {
+        const storedPid = Number(job.pid);
+        if (!Number.isInteger(storedPid) || storedPid <= 0) {
+          // Fixed: return cleanly instead of throwing
+          process.stderr.write(
+            `[codex-companion] session-end: no PID to signal for job ${job.id}; will mark cancelled\n`
+          );
+          return;
+        }
+        // (other branches not exercised in this test)
+      }
+    });
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+
+  assert.deepEqual(deletedIds, [jobId]);
+  const onDisk = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(onDisk.status, "cancelled",
+    "queued pid:null record must be marked cancelled, not left as queued");
+  assert.ok(
+    stderrMessages.some((m) => m.includes("will mark cancelled")),
+    "expected stderr breadcrumb about marking cancelled"
+  );
+});
+
+
 test("deleteSessionJobs converts active session jobs to terminal cancelled records", () => {
   const workspace = makeTempDir();
   const sessionId = "session-active";

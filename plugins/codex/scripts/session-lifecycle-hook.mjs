@@ -53,11 +53,16 @@ function cleanupSessionJobs(cwd, sessionId) {
       const storedPid = Number(job.pid);
       const storedPidStartTime = job.pidStartTime ?? null;
       if (!Number.isInteger(storedPid) || storedPid <= 0) {
-        // No valid pid — cannot signal anything.
+        // No PID to signal (queued record before the worker took over,
+        // or a record that never recorded an identity). Nothing to
+        // terminate; return so deleteSessionJobs proceeds to write the
+        // cancellation record. A late-starting worker will see the
+        // terminal record in its initial-transition pre-check and abort
+        // cleanly.
         process.stderr.write(
-          `[codex-companion] session-end: skipped pid termination for job ${job.id} (no valid pid)\n`
+          `[codex-companion] session-end: no PID to signal for job ${job.id}; will mark cancelled\n`
         );
-        throw new Error("session-end identity unverifiable; record left intact");
+        return;
       }
       if (!identityVerificationSupported()) {
         process.stderr.write(

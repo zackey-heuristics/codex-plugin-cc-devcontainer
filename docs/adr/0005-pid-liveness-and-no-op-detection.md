@@ -391,6 +391,16 @@ narrowing.
   only to legacy records or non-Linux platforms. A per-job stderr
   diagnostic surfaces each skipped case; further automation is out
   of scope.
+
+  **Exception: queued records with `pid: null`.** A `queued` record has
+  no live worker by definition. When session-end encounters a `queued`
+  record whose `pid` is `null`, the hook skips the signal (nothing to
+  signal) but does NOT throw — it returns cleanly so
+  `deleteSessionJobs` writes the cancellation record. A worker that
+  starts after session teardown sees the terminal record in its
+  initial-transition pre-check and aborts cleanly, preserving the same
+  safety property described in the Queued startup window trade-off
+  above.
 - **No general `updatedAt` heartbeat.** The single
   `updatedAt`-bounded reconciliation path is the 30-second
   queued-grace window for records that have `pid: null` (worker
