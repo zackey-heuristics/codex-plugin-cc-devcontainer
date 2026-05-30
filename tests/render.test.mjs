@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import { buildStatusSnapshot } from "../plugins/codex/scripts/lib/job-control.mjs";
 import {
+  renderActiveJobConflict,
   renderCancelReport,
   renderReviewResult,
   renderSetupReport,
@@ -260,4 +261,27 @@ test("buildStatusSnapshot counts review invokers across workspace sessions", () 
   assert.equal(snapshot.recent.length, 0);
   assert.equal(snapshot.reviewInvokerBreakdown.total, 3);
   assert.equal(snapshot.reviewInvokerBreakdown.byInvoker["claude-subagent"], 3);
+});
+
+test("renderActiveJobConflict interpolates the job id into every cancel hint", () => {
+  const output = renderActiveJobConflict({
+    id: "task-abc123",
+    title: "stuck task",
+    status: "running",
+    phase: "running",
+    createdAt: "2026-05-30T00:00:00Z",
+    updatedAt: "2026-05-30T00:05:00Z",
+    workspaceRoot: "/tmp/ws"
+  });
+
+  assert.ok(!output.includes("${id}"), "rendered text must not contain a literal ${id} token");
+  assert.ok(
+    output.includes("/codex:cancel task-abc123"),
+    "rendered text must include the interpolated cancel command for the job id"
+  );
+  // The stuck-job hint should reference the specific job id, not the literal token.
+  assert.match(
+    output,
+    /If this job is stuck or its process has died, \/codex:cancel task-abc123/
+  );
 });

@@ -412,7 +412,7 @@ export function renderActiveJobConflict(job) {
     `To cancel:   /codex:cancel ${id}`,
     "To resume:   /codex:rescue --resume",
     "",
-    "If this job is stuck or its process has died, /codex:cancel ${id}",
+    `If this job is stuck or its process has died, /codex:cancel ${id}`,
     "will release it (or wait for the next reconciliation pass)."
   ];
   return lines.join("\n");
