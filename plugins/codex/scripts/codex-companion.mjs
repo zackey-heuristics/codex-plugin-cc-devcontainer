@@ -35,6 +35,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  getPidStatus,
   readPidStartTime,
   reconcileStaleActiveJobs,
   setConfig,
@@ -1049,13 +1050,20 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-function classifyCancelIdentity(storedPid, storedPidStartTime) {
+export function classifyCancelIdentity(storedPid, storedPidStartTime) {
   const pid = Number(storedPid);
   if (!Number.isInteger(pid) || pid <= 0) {
     return { kind: "no-pid", pid: null };
   }
   if (storedPidStartTime == null || storedPidStartTime === "") {
     return { kind: "unverifiable", pid, reason: "no recorded pidStartTime" };
+  }
+  const pidStatus = getPidStatus(pid);
+  if (!pidStatus.exists) {
+    return { kind: "dead-no-process", pid, reason: "process no longer exists (ESRCH)" };
+  }
+  if (pidStatus.permissionDenied && pidStatus.sameUser === false) {
+    return { kind: "dead-no-process", pid, reason: "recorded PID now owned by a different user" };
   }
   const livePidStartTime = readPidStartTime(pid);
   if (livePidStartTime == null) {
@@ -1110,6 +1118,10 @@ async function handleCancel(argv) {
   } else if (identity.kind === "mismatch") {
     process.stderr.write(
       `[codex-companion] cancel: target PID no longer matches recorded identity; marking record cancelled without signal.\n`
+    );
+  } else if (identity.kind === "dead-no-process") {
+    process.stderr.write(
+      `[codex-companion] cancel: recorded PID ${identity.pid} no longer exists; marking record cancelled without signal.\n`
     );
   } else if (identity.kind === "no-pid") {
     // No pid was ever recorded (legacy record, or queued worker that never

@@ -312,7 +312,7 @@ export function readPidStartTime(pid) {
   }
 }
 
-function getPidStatus(pid) {
+export function getPidStatus(pid) {
   try {
     process.kill(pid, 0);
     return { exists: true, permissionDenied: false, sameUser: true };

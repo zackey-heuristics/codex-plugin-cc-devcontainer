@@ -152,8 +152,11 @@ that signalled PIDs from records are tightened:
   before calling `terminateProcessTree(job.pid)`. On match, normal
   cancellation. On mismatch, write the `cancelled` record without
   signalling (the original worker is gone) and emit a one-line
-  stderr diagnostic. On unverifiable identity (legacy record, null
-  `pidStartTime`, `/proc` unreadable), refuse by default with a
+  stderr diagnostic. If the process provably does not exist (ESRCH),
+  treat it like mismatch: write the `cancelled` record without
+  signalling and emit a one-line stderr diagnostic — no `--force`
+  required. On unverifiable identity due to permission-denied
+  (`/proc` unreadable, same-user unknown), refuse by default with a
   clear error pointing at `--force`; `--force` signals and
   cancels with operator acknowledgement.
 - **`deleteSessionJobs`'s `onMatchUnderLock` callback** in

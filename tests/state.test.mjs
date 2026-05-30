@@ -2319,3 +2319,29 @@ test("upsertJob still caps old review jobs", () => {
   assert.equal(loadedJobs.length, 50);
   assert.equal(loadedJobIds.has("old-review-0"), false);
 });
+
+// ---------------------------------------------------------------------------
+// classifyCancelIdentity: dead-no-process for an exited PID
+// ---------------------------------------------------------------------------
+
+import { classifyCancelIdentity } from "../plugins/codex/scripts/codex-companion.mjs";
+
+test("classifyCancelIdentity returns dead-no-process when recorded PID has exited", async () => {
+  // Spawn a short-lived child process and wait for it to exit.
+  const child = spawn(process.execPath, ["--eval", "process.exit(0)"], {
+    stdio: "ignore"
+  });
+  const deadPid = child.pid;
+
+  await new Promise((resolve) => child.on("exit", resolve));
+
+  // Give the OS a moment to clean up the process entry.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const result = classifyCancelIdentity(deadPid, "some-stored-starttime");
+  assert.equal(
+    result.kind,
+    "dead-no-process",
+    `Expected kind "dead-no-process" for exited PID ${deadPid}, got "${result.kind}" (reason: ${result.reason})`
+  );
+});
