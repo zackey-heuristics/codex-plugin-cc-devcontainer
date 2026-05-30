@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { deleteSessionJobs } from "./lib/state.mjs";
+import { deleteSessionJobs, readPidStartTime } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -50,8 +50,26 @@ function cleanupSessionJobs(cwd, sessionId) {
       if (!stillRunning) {
         return;
       }
+      const storedPid = Number(job.pid);
+      const storedPidStartTime = job.pidStartTime ?? null;
+      if (!Number.isInteger(storedPid) || storedPid <= 0 || storedPidStartTime == null) {
+        // Identity unverifiable — do NOT signal and skip cancellation
+        // entirely. The existing deleteSessionJobs contract treats a
+        // thrown error as "skip this job".
+        process.stderr.write(
+          `[codex-companion] session-end: skipped pid termination for job ${job.id} (identity unverifiable)\n`
+        );
+        throw new Error("session-end identity unverifiable; record left intact");
+      }
+      const livePidStartTime = readPidStartTime(storedPid);
+      if (livePidStartTime == null || String(storedPidStartTime) !== String(livePidStartTime)) {
+        process.stderr.write(
+          `[codex-companion] session-end: skipped pid termination for job ${job.id} (identity unverifiable)\n`
+        );
+        throw new Error("session-end identity unverifiable; record left intact");
+      }
       try {
-        terminateProcessTree(job.pid ?? Number.NaN);
+        terminateProcessTree(storedPid);
       } catch {
         // Ignore teardown failures during session shutdown.
       }

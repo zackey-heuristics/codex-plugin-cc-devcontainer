@@ -35,6 +35,8 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  readPidStartTime,
+  reconcileStaleActiveJobs,
   setConfig,
   upsertJob
 } from "./lib/state.mjs";
@@ -59,7 +61,9 @@ import {
 import { resolveTurnSandboxPolicy } from "./lib/turn-sandbox-policy.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  renderActiveJobConflict,
   renderNativeReviewResult,
+  renderNoOpDiagnostic,
   renderReviewResult,
   renderStoredJobResult,
   renderCancelReport,
@@ -362,7 +366,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
-    throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
+    throw new Error(renderActiveJobConflict({ ...activeTask, workspaceRoot }));
   }
 
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
@@ -484,6 +488,11 @@ async function executeReviewRun(request) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  try {
+    reconcileStaleActiveJobs(workspaceRoot);
+  } catch {
+    // Best-effort: reconciliation failures must not block a new task.
+  }
   ensureCodexAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
@@ -522,24 +531,54 @@ async function executeTaskRun(request) {
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
+
+  // No-op detection: when --write was used but Codex returned a "completed"
+  // turn with empty finalMessage and zero touched files, the task did
+  // nothing. We surface this explicitly so /codex:status shows `failed`
+  // and the rendered stdout is a structured diagnostic (the helper itself
+  // still exits 0 so the rescue subagent returns the diagnostic as-is).
+  const touchedFiles = Array.isArray(result.touchedFiles) ? result.touchedFiles : [];
+  const commandsRun = Array.isArray(result.commandExecutions) ? result.commandExecutions.length : 0;
+  const isNoOpRun =
+    result.status === 0 && (!rawOutput || rawOutput.trim() === "") && touchedFiles.length === 0;
+  const treatAsFailure = Boolean(request.write) && isNoOpRun;
+
+  let rendered;
+  let summary;
+  if (treatAsFailure) {
+    rendered = renderNoOpDiagnostic({
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
-  );
+      title: taskMetadata.title,
+      durationMs: null,
+      touchedFiles: 0,
+      commandsRun,
+      threadId: result.threadId ?? null,
+      logFile: null
+    });
+    summary = "Codex completed with no output and no changes (likely no-op).";
+  } else {
+    rendered = renderTaskResult(
+      {
+        rawOutput,
+        failureMessage,
+        reasoningSummary: result.reasoningSummary
+      },
+      {
+        title: taskMetadata.title,
+        jobId: request.jobId ?? null,
+        write: Boolean(request.write)
+      }
+    );
+    summary = firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`));
+  }
+
   const payload = {
     status: result.status,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(treatAsFailure ? { noOp: true } : {})
   };
 
   return {
@@ -548,10 +587,11 @@ async function executeTaskRun(request) {
     turnId: result.turnId,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary,
     jobTitle: taskMetadata.title,
     jobClass: "task",
-    write: Boolean(request.write)
+    write: Boolean(request.write),
+    ...(treatAsFailure ? { noOp: true } : {})
   };
 }
 
@@ -683,19 +723,44 @@ function spawnDetachedTaskWorker(cwd, jobId) {
 }
 
 function enqueueBackgroundTask(cwd, job, request) {
+  try {
+    reconcileStaleActiveJobs(job.workspaceRoot);
+  } catch {
+    // Best-effort: reconciliation failures must not block enqueue.
+  }
+
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Durable queued record FIRST, then spawn. The parent does not attach
+  // child.pid; identity is written exclusively by the worker on its first
+  // running transition (Issue #10).
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
+    pidStartTime: null,
     logFile,
     request
   };
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  try {
+    spawnDetachedTaskWorker(cwd, job.id);
+  } catch (error) {
+    // Synchronous spawn failure: write a terminal failed record so the
+    // queued state does not linger.
+    const message = error instanceof Error ? error.message : String(error);
+    upsertJob(job.workspaceRoot, {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      completedAt: nowIso(),
+      errorMessage: `Failed to spawn background worker: ${message}`
+    });
+    throw error;
+  }
 
   return {
     payload: {
@@ -919,7 +984,7 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    outputCommandResult(snapshot, renderJobStatusReport(snapshot), options.json);
     return;
   }
 
@@ -984,10 +1049,28 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+function classifyCancelIdentity(storedPid, storedPidStartTime) {
+  const pid = Number(storedPid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { kind: "no-pid", pid: null };
+  }
+  if (storedPidStartTime == null || storedPidStartTime === "") {
+    return { kind: "unverifiable", pid, reason: "no recorded pidStartTime" };
+  }
+  const livePidStartTime = readPidStartTime(pid);
+  if (livePidStartTime == null) {
+    return { kind: "unverifiable", pid, reason: "live pidStartTime unreadable" };
+  }
+  if (String(storedPidStartTime) !== String(livePidStartTime)) {
+    return { kind: "mismatch", pid, reason: "stored pidStartTime no longer matches live process" };
+  }
+  return { kind: "match", pid };
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "force"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -996,6 +1079,21 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+
+  const identity = classifyCancelIdentity(
+    existing.pid ?? job.pid,
+    existing.pidStartTime ?? job.pidStartTime
+  );
+
+  if (identity.kind === "unverifiable" && !options.force) {
+    const message =
+      `Cannot verify PID identity for job ${job.id} (${identity.reason}). ` +
+      `The recorded PID could now belong to an unrelated process. ` +
+      `Use /codex:cancel --force ${job.id} to override and signal the recorded PID anyway.`;
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -1007,7 +1105,25 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  if (identity.kind === "match") {
+    terminateProcessTree(identity.pid);
+  } else if (identity.kind === "mismatch") {
+    process.stderr.write(
+      `[codex-companion] cancel: target PID no longer matches recorded identity; marking record cancelled without signal.\n`
+    );
+  } else if (identity.kind === "no-pid") {
+    // No pid was ever recorded (legacy record, or queued worker that never
+    // wrote its running transition). Nothing to signal; just record the
+    // cancellation.
+  } else if (identity.kind === "unverifiable" && options.force) {
+    process.stderr.write(
+      `[codex-companion] cancel: force override — identity unverifiable; signalling recorded PID anyway.\n`
+    );
+    if (identity.pid != null) {
+      terminateProcessTree(identity.pid);
+    }
+  }
+
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
