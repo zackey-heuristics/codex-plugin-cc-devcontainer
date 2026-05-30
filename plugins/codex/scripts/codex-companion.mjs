@@ -34,6 +34,7 @@ import {
 import {
   generateJobId,
   getConfig,
+  identityVerificationSupported,
   listJobs,
   getPidStatus,
   readPidStartTime,
@@ -1055,6 +1056,13 @@ export function classifyCancelIdentity(storedPid, storedPidStartTime) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return { kind: "no-pid", pid: null };
   }
+  if (!identityVerificationSupported()) {
+    return {
+      kind: "platform-unverifiable",
+      pid,
+      reason: `identity verification not available on platform ${process.platform}`
+    };
+  }
   if (storedPidStartTime == null || storedPidStartTime === "") {
     return { kind: "unverifiable", pid, reason: "no recorded pidStartTime" };
   }
@@ -1093,6 +1101,13 @@ async function handleCancel(argv) {
     existing.pidStartTime ?? job.pidStartTime
   );
 
+  if (identity.kind === "platform-unverifiable") {
+    process.stderr.write(
+      `[codex-companion] cancel: PID identity verification not available on ${process.platform}; proceeding to signal recorded PID without identity check.\n`
+    );
+    // Fall through to the signal+cancel flow below.
+  }
+
   if (identity.kind === "unverifiable" && !options.force) {
     const message =
       `Cannot verify PID identity for job ${job.id} (${identity.reason}). ` +
@@ -1115,6 +1130,10 @@ async function handleCancel(argv) {
 
   if (identity.kind === "match") {
     terminateProcessTree(identity.pid);
+  } else if (identity.kind === "platform-unverifiable") {
+    if (identity.pid != null) {
+      terminateProcessTree(identity.pid);
+    }
   } else if (identity.kind === "mismatch") {
     process.stderr.write(
       `[codex-companion] cancel: target PID no longer matches recorded identity; marking record cancelled without signal.\n`

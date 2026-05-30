@@ -20,6 +20,7 @@ import {
   resolveStateFile,
   saveState,
   writeJobFileForTest,
+  identityVerificationSupported,
   upsertJob
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
@@ -2344,4 +2345,26 @@ test("classifyCancelIdentity returns dead-no-process when recorded PID has exite
     "dead-no-process",
     `Expected kind "dead-no-process" for exited PID ${deadPid}, got "${result.kind}" (reason: ${result.reason})`
   );
+});
+
+// ---------------------------------------------------------------------------
+// identityVerificationSupported and platform-unverifiable kind
+// ---------------------------------------------------------------------------
+
+test("identityVerificationSupported is true on linux and false elsewhere", () => {
+  assert.equal(identityVerificationSupported("linux"), true);
+  assert.equal(identityVerificationSupported("darwin"), false);
+  assert.equal(identityVerificationSupported("win32"), false);
+});
+
+test("classifyCancelIdentity returns platform-unverifiable on non-Linux", () => {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+  try {
+    const result = classifyCancelIdentity(99999, null);
+    assert.equal(result.kind, "platform-unverifiable");
+    assert.equal(result.pid, 99999);
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
 });

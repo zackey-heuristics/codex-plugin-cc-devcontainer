@@ -175,6 +175,18 @@ The shared principle: trust only verifiable identity for automatic
 decisions; surface unverifiable cases as warnings and let the
 operator override consciously.
 
+**Non-Linux platforms.** Identity verification depends on `/proc/<pid>/stat`
+(Linux-only). On non-Linux platforms (`process.platform !== "linux"`),
+`readPidStartTime` always returns `null`, so the identity check is
+fundamentally unavailable. To keep the cancel and session-end paths usable,
+both fall back to pre-verification behavior on non-Linux — they signal the
+recorded PID via `terminateProcessTree` without a start-time comparison and
+emit a one-line stderr breadcrumb. This restores the pre-Issue-#10 baseline
+on those platforms; it does NOT extend the same PID-reuse-safety guarantee
+that Linux gets. Operators on darwin/win32 see exactly the cancel UX they
+had before this PR, with a clear log line announcing that the new safety
+mechanism is off for their platform.
+
 ### B. No-op completion detection (write-mode only)
 
 In `executeTaskRun`, after `runAppServerTurn` returns, derive:

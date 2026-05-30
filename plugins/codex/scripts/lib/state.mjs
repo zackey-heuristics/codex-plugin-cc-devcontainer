@@ -312,6 +312,11 @@ export function readPidStartTime(pid) {
   }
 }
 
+
+export function identityVerificationSupported(platform = process.platform) {
+  return platform === "linux";
+}
+
 export function getPidStatus(pid) {
   try {
     process.kill(pid, 0);
