@@ -2429,3 +2429,61 @@ test("classifyCancelIdentity returns platform-unverifiable on non-Linux", () => 
     Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Cancel-patch sparseness: upsertJob preserves worker-written fields when the
+// cancel patch only carries cancellation-owned fields (regression for the
+// handleCancel stale-snapshot-overwrites-fresh bug).
+// ---------------------------------------------------------------------------
+
+test("upsertJob preserves worker-written fields when cancel patch is sparse", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-cancel-sparse";
+
+  // Pre-populate disk with a running record that has fields the worker
+  // would have written after the original list snapshot was taken.
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "verifying",
+    title: "background task",
+    kind: "task",
+    threadId: "thr_worker_set",
+    turnId: "turn_worker_set",
+    summary: "worker progress summary",
+    logFile: "/tmp/logs/task-cancel-sparse.log",
+    pid: 12345,
+    pidStartTime: "9999",
+    pidStartedAtMs: 1700000000000
+  });
+
+  const completedAt = new Date().toISOString();
+  // The sparse cancel patch that handleCancel now sends: id + the fields
+  // cancellation actually owns.
+  const returned = upsertJob(workspace, {
+    id: jobId,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt,
+    cancelledAt: completedAt,
+    errorMessage: "Cancelled by user."
+  });
+
+  assert.equal(returned.status, "cancelled");
+  assert.equal(returned.phase, "cancelled");
+  assert.equal(returned.pid, null);
+  assert.equal(returned.completedAt, completedAt);
+  assert.equal(returned.cancelledAt, completedAt);
+  assert.equal(returned.errorMessage, "Cancelled by user.");
+
+  // The worker-written fields must survive — this is what the bugfix
+  // guarantees. Before the fix, handleCancel built the patch from `job`
+  // (the stale list snapshot) which would have nulled these out.
+  assert.equal(returned.threadId, "thr_worker_set");
+  assert.equal(returned.turnId, "turn_worker_set");
+  assert.equal(returned.summary, "worker progress summary");
+  assert.equal(returned.logFile, "/tmp/logs/task-cancel-sparse.log");
+  assert.equal(returned.title, "background task");
+  assert.equal(returned.kind, "task");
+});

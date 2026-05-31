@@ -1158,19 +1158,20 @@ async function handleCancel(argv) {
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
-  const nextJob = {
-    ...job,
+  // Send only the fields cancellation owns. upsertJob takes the per-job
+  // lock, re-reads the on-disk record, and merges this patch onto it —
+  // so any worker-written fields (threadId, turnId, summary, logFile,
+  // …) that landed between resolveCancelableJob and this call are
+  // preserved from the freshest disk state rather than being clobbered
+  // by stale values from the list snapshot.
+  const returnedJob = upsertJob(workspaceRoot, {
+    id: job.id,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
     completedAt,
+    cancelledAt: completedAt,
     errorMessage: "Cancelled by user."
-  };
-
-  const returnedJob = upsertJob(workspaceRoot, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
   });
   const cancelNote =
     returnedJob.status === "cancelled"
