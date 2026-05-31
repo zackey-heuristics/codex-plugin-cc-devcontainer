@@ -2,7 +2,7 @@ import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { INVOKER_VALUES } from "./invoker.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, reconcileStaleActiveJobs, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -265,8 +265,28 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
+function safeReconcile(workspaceRoot) {
+  try {
+    const { reconciledIds, warnings } = reconcileStaleActiveJobs(workspaceRoot);
+    return { reconciledIds, warnings };
+  } catch (error) {
+    return {
+      reconciledIds: [],
+      warnings: [
+        {
+          jobId: null,
+          pid: null,
+          reason: "reconcile-error",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      ]
+    };
+  }
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
   const config = getConfig(workspaceRoot);
   const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const jobs = filterJobsForCurrentSession(workspaceJobs, options);
@@ -292,12 +312,14 @@ export function buildStatusSnapshot(cwd, options = {}) {
     latestFinished,
     recent,
     reviewInvokerBreakdown: buildReviewInvokerBreakdown(workspaceJobs, options),
-    needsReview: Boolean(config.stopReviewGate)
+    needsReview: Boolean(config.stopReviewGate),
+    reconciliationWarnings
   };
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
@@ -306,12 +328,14 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines }),
+    reconciliationWarnings
   };
 }
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
@@ -320,7 +344,7 @@ export function resolveResultJob(cwd, reference) {
   );
 
   if (selected) {
-    return { workspaceRoot, job: selected };
+    return { workspaceRoot, job: selected, reconciliationWarnings };
   }
 
   const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");

@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { deleteSessionJobs } from "./lib/state.mjs";
+import { deleteSessionJobs, identityVerificationSupported, readPidStartTime } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -50,8 +50,49 @@ function cleanupSessionJobs(cwd, sessionId) {
       if (!stillRunning) {
         return;
       }
+      const storedPid = Number(job.pid);
+      const storedPidStartTime = job.pidStartTime ?? null;
+      if (!Number.isInteger(storedPid) || storedPid <= 0) {
+        // No PID to signal (queued record before the worker took over,
+        // or a record that never recorded an identity). Nothing to
+        // terminate; return so deleteSessionJobs proceeds to write the
+        // cancellation record. A late-starting worker will see the
+        // terminal record in its initial-transition pre-check and abort
+        // cleanly.
+        process.stderr.write(
+          `[codex-companion] session-end: no PID to signal for job ${job.id}; will mark cancelled\n`
+        );
+        return;
+      }
+      if (!identityVerificationSupported()) {
+        process.stderr.write(
+          `[codex-companion] session-end: proceeding without identity verification on ${process.platform} for job ${job.id}\n`
+        );
+        try {
+          terminateProcessTree(storedPid);
+        } catch {
+          // Ignore teardown failures during session shutdown.
+        }
+        return;
+      }
+      if (storedPidStartTime == null) {
+        // Identity unverifiable — do NOT signal and skip cancellation
+        // entirely. The existing deleteSessionJobs contract treats a
+        // thrown error as "skip this job".
+        process.stderr.write(
+          `[codex-companion] session-end: skipped pid termination for job ${job.id} (identity unverifiable)\n`
+        );
+        throw new Error("session-end identity unverifiable; record left intact");
+      }
+      const livePidStartTime = readPidStartTime(storedPid);
+      if (livePidStartTime == null || String(storedPidStartTime) !== String(livePidStartTime)) {
+        process.stderr.write(
+          `[codex-companion] session-end: skipped pid termination for job ${job.id} (identity unverifiable)\n`
+        );
+        throw new Error("session-end identity unverifiable; record left intact");
+      }
       try {
-        terminateProcessTree(job.pid ?? Number.NaN);
+        terminateProcessTree(storedPid);
       } catch {
         // Ignore teardown failures during session shutdown.
       }

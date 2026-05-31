@@ -338,6 +338,101 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function formatNoOpDuration(durationMs) {
+  if (durationMs == null || !Number.isFinite(durationMs)) {
+    return "unknown";
+  }
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+export function renderNoOpDiagnostic({
+  jobId,
+  title,
+  durationMs,
+  touchedFiles,
+  commandsRun,
+  threadId,
+  logFile
+} = {}) {
+  const lines = [
+    "Codex run completed with no assistant output and no file changes.",
+    "",
+    `Job ID:        ${jobId ?? "(unknown)"}`,
+    `Title:         ${title ?? "(unknown)"}`,
+    "Status:        failed (no-op)",
+    `Duration:      ${formatNoOpDuration(durationMs)}`,
+    `Files changed: ${typeof touchedFiles === "number" ? touchedFiles : 0}`,
+    `Commands run:  ${typeof commandsRun === "number" ? commandsRun : 0}`,
+    "Final message: (empty)",
+    "Codex turn status: completed",
+    `Thread ID:     ${threadId ?? "n/a"}`,
+    `Log file:      ${logFile ?? "n/a"}`,
+    "",
+    "This usually means Codex returned without producing a result.",
+    "Possible causes:",
+    "- Codex believed the task was already complete and exited.",
+    "- A tool call ran but no assistant follow-up was produced.",
+    "- An internal Codex protocol issue swallowed the final message.",
+    "",
+    "Next steps:",
+    `- Retry as a fresh run: /codex:rescue --fresh <prompt>`,
+    `- Inspect the log: /codex:status ${jobId ?? "<id>"}`,
+    "- Cancel any other active jobs: /codex:cancel"
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+export function renderActiveJobConflict(job) {
+  const id = job?.id ?? "(unknown)";
+  const title = job?.title ?? "(no title)";
+  const status = job?.status ?? "(unknown)";
+  const phase = job?.phase ?? "(unknown)";
+  const createdAt = job?.createdAt ?? "(unknown)";
+  const updatedAt = job?.updatedAt ?? "(unknown)";
+  const workspace = job?.workspaceRoot ?? "(unknown)";
+  const lines = [
+    "Cannot start a new Codex task: an active job is still in progress.",
+    "",
+    "Active job:",
+    `- ID:        ${id}`,
+    `- Title:     ${title}`,
+    `- Status:    ${status}`,
+    `- Phase:     ${phase}`,
+    `- Created:   ${createdAt}`,
+    `- Updated:   ${updatedAt}`,
+    `- Workspace: ${workspace}`,
+    "",
+    `To inspect:  /codex:status ${id}`,
+    `To cancel:   /codex:cancel ${id}`,
+    "To resume:   /codex:rescue --resume",
+    "",
+    `If this job is stuck or its process has died, /codex:cancel ${id}`,
+    "will release it (or wait for the next reconciliation pass)."
+  ];
+  return lines.join("\n");
+}
+
+export function renderReconciliationWarnings(warnings) {
+  if (!Array.isArray(warnings) || warnings.length === 0) {
+    return "";
+  }
+  const lines = ["Warnings:"];
+  for (const warning of warnings) {
+    const jobId = warning?.jobId == null ? "(workspace)" : String(warning.jobId);
+    const pid = warning?.pid == null ? "-" : String(warning.pid);
+    const reason = warning?.reason ?? "unknown";
+    const message = warning?.message ?? "";
+    lines.push(`- job=${jobId} pid=${pid} reason=${reason} ${message}`.trimEnd());
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   if (rawOutput) {
@@ -399,10 +494,19 @@ export function renderStatusReport(report) {
 
   appendReviewInvokerAggregate(lines, report.reviewInvokerBreakdown);
 
-  return `${lines.join("\n").trimEnd()}\n`;
+  const warningsBlock = renderReconciliationWarnings(report?.reconciliationWarnings);
+  const trimmedReport = lines.join("\n").trimEnd();
+  return warningsBlock ? `${trimmedReport}\n\n${warningsBlock.trimEnd()}\n` : `${trimmedReport}\n`;
 }
 
-export function renderJobStatusReport(job) {
+export function renderJobStatusReport(snapshot) {
+  // Accept either a bare job object (legacy callers) or a snapshot
+  // with .job + .reconciliationWarnings (new path).
+  const job = snapshot && typeof snapshot === "object" && "job" in snapshot ? snapshot.job : snapshot;
+  const warnings =
+    snapshot && typeof snapshot === "object" && "reconciliationWarnings" in snapshot
+      ? snapshot.reconciliationWarnings
+      : null;
   const lines = ["# Codex Job Status", ""];
   pushJobDetails(lines, job, {
     showElapsed: job.status === "queued" || job.status === "running",
@@ -412,7 +516,9 @@ export function renderJobStatusReport(job) {
     showResultHint: true,
     showReviewHint: true
   });
-  return `${lines.join("\n").trimEnd()}\n`;
+  const warningsBlock = renderReconciliationWarnings(warnings);
+  const trimmed = lines.join("\n").trimEnd();
+  return warningsBlock ? `${trimmed}\n\n${warningsBlock.trimEnd()}\n` : `${trimmed}\n`;
 }
 
 export function renderStoredJobResult(job, storedJob) {

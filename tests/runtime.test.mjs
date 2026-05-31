@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { listJobs, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, readPidStartTime, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -1479,6 +1479,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
         jobClass: "task",
         summary: "Investigate flaky test",
         pid: sleeper.pid,
+        pidStartTime: readPidStartTime(sleeper.pid),
         logFile,
         createdAt: "2026-03-18T15:30:00.000Z",
         startedAt: "2026-03-18T15:30:01.000Z",
@@ -1503,6 +1504,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             jobClass: "task",
             summary: "Investigate flaky test",
             pid: sleeper.pid,
+            pidStartTime: readPidStartTime(sleeper.pid),
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1774,6 +1776,7 @@ test("session end removes terminal jobs and cancels active jobs for the ending s
         title: "Codex Review",
         sessionId: "sess-current",
         pid: sleeper.pid,
+        pidStartTime: readPidStartTime(sleeper.pid),
         logFile: runningLog,
         createdAt: "2026-03-18T15:32:00.000Z",
         updatedAt: "2026-03-18T15:33:00.000Z"
@@ -1818,6 +1821,7 @@ test("session end removes terminal jobs and cancels active jobs for the ending s
             title: "Codex Review",
             sessionId: "sess-current",
             pid: sleeper.pid,
+            pidStartTime: readPidStartTime(sleeper.pid),
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"

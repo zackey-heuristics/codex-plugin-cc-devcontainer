@@ -13,9 +13,20 @@ const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 export const MAX_RECENT_REVIEW_JOBS = 500;
 const RECENT_REVIEW_RETENTION_MS = 65 * 60_000;
+const ACTIVE_JOB_MISSING_PID_GRACE_MS = 30_000;
 const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
 const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
-const TERMINAL_STICKY_FIELDS = ["phase", "completedAt", "cancelledAt", "errorMessage", "result", "rendered", "pid"];
+const TERMINAL_STICKY_FIELDS = [
+  "phase",
+  "completedAt",
+  "cancelledAt",
+  "errorMessage",
+  "result",
+  "rendered",
+  "pid",
+  "pidStartTime",
+  "pidStartedAtMs"
+];
 const JOB_LOCK_RETRY_COUNT = 200;
 const JOB_LOCK_RETRY_DELAY_MS = 25;
 const JOB_LOCK_INCOMPLETE_STALE_MS = JOB_LOCK_RETRY_COUNT * JOB_LOCK_RETRY_DELAY_MS;
@@ -277,7 +288,36 @@ function readProcessUid(pid) {
   }
 }
 
-function getPidStatus(pid) {
+export function readPidStartTime(pid) {
+  if (process.platform !== "linux") {
+    return null;
+  }
+
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return null;
+  }
+
+  try {
+    const stat = fs.readFileSync(`/proc/${numericPid}/stat`, "utf8");
+    const commEnd = stat.lastIndexOf(")");
+    if (commEnd === -1) {
+      return null;
+    }
+
+    const fieldsAfterComm = stat.slice(commEnd + 1).split(/\s+/);
+    return fieldsAfterComm[20] || null;
+  } catch {
+    return null;
+  }
+}
+
+
+export function identityVerificationSupported(platform = process.platform) {
+  return platform === "linux";
+}
+
+export function getPidStatus(pid) {
   try {
     process.kill(pid, 0);
     return { exists: true, permissionDenied: false, sameUser: true };
@@ -627,7 +667,7 @@ function acquireJobLock(cwd, jobId) {
   }
 }
 
-function withJobLock(cwd, jobId, fn) {
+export function withJobLock(cwd, jobId, fn) {
   // Per-job lock serializes cross-process read/write and prune/delete critical sections.
   const { lockPath, token } = acquireJobLock(cwd, jobId);
   try {
@@ -802,6 +842,186 @@ export function listJobs(cwd) {
   return sortJobsByUpdatedDesc(jobs);
 }
 
+function normalizePid(pid) {
+  const numericPid = Number(pid);
+  return Number.isInteger(numericPid) && numericPid > 0 ? numericPid : null;
+}
+
+function makeReconcileWarning(jobId, pid, reason, message) {
+  return {
+    jobId: jobId ?? null,
+    pid: pid ?? null,
+    reason,
+    message
+  };
+}
+
+function isMissingPidStale(job) {
+  const updatedAtMs = Date.parse(job?.updatedAt ?? "");
+  return Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs > ACTIVE_JOB_MISSING_PID_GRACE_MS;
+}
+
+function classifyActiveJobForReconciliation(job) {
+  const pid = normalizePid(job?.pid);
+  if (pid == null) {
+    // The 30s queued-grace only applies to `queued` records (waiting for
+    // their worker to take the first lock). A `running` record without a
+    // pid is a legacy / unverifiable case: surface a warning but do NOT
+    // terminalize on updatedAt age alone.
+    if (job?.status !== "queued") {
+      return {
+        pid: null,
+        dead: false,
+        warning: makeReconcileWarning(
+          job?.id,
+          null,
+          "legacy-no-identity",
+          "Active record has no recorded pid; leaving active state unchanged."
+        )
+      };
+    }
+    return {
+      pid: null,
+      dead: isMissingPidStale(job),
+      warning: null
+    };
+  }
+
+  const pidStatus = getPidStatus(pid);
+  if (!pidStatus.exists || (pidStatus.permissionDenied && pidStatus.sameUser === false)) {
+    return { pid, dead: true, warning: null };
+  }
+
+  if (pidStatus.permissionDenied) {
+    return {
+      pid,
+      dead: false,
+      warning: makeReconcileWarning(
+        job?.id,
+        pid,
+        "proc-unreadable",
+        "Process exists but cannot be identity-verified due to permission restrictions."
+      )
+    };
+  }
+
+  if (!hasOwn(job, "pidStartTime")) {
+    return {
+      pid,
+      dead: false,
+      warning: makeReconcileWarning(
+        job?.id,
+        pid,
+        "legacy-no-identity",
+        "Job record has no pidStartTime field; leaving active state unchanged."
+      )
+    };
+  }
+
+  const livePidStartTime = readPidStartTime(pid);
+  if (job.pidStartTime == null || livePidStartTime == null) {
+    return {
+      pid,
+      dead: false,
+      warning: makeReconcileWarning(
+        job?.id,
+        pid,
+        "proc-unreadable",
+        "Process identity cannot be confirmed from pidStartTime; leaving active state unchanged."
+      )
+    };
+  }
+
+  return {
+    pid,
+    dead: String(job.pidStartTime) !== livePidStartTime,
+    warning: null
+  };
+}
+
+export function reconcileStaleActiveJobs(cwd, options = {}) {
+  void options;
+
+  const reconciledIds = [];
+  const warnings = [];
+
+  try {
+    const jobs = listJobs(cwd);
+    for (const job of jobs) {
+      if (!isActiveJobStatus(job?.status)) {
+        continue;
+      }
+
+      try {
+        const classification = classifyActiveJobForReconciliation(job);
+        if (classification.warning) {
+          warnings.push(classification.warning);
+        }
+        if (!classification.dead) {
+          continue;
+        }
+
+        withJobLock(cwd, job.id, (revalidateLock) => {
+          const jobFile = resolveJobFile(cwd, job.id);
+          let currentJob = null;
+          try {
+            currentJob = readJobFile(jobFile);
+          } catch (error) {
+            if (error?.code !== "ENOENT") {
+              throw error;
+            }
+            return;
+          }
+
+          if (currentJob.updatedAt !== job.updatedAt || !isActiveJobStatus(currentJob.status)) {
+            return;
+          }
+
+          // Re-verify the identity that the out-of-lock classification was
+          // based on. If pid or pidStartTime changed between classification
+          // and lock acquisition, the record is no longer the one we
+          // classified dead — abort to avoid terminalizing a different
+          // process identity.
+          const sameIdentity =
+            (currentJob.pid ?? null) === (job.pid ?? null) &&
+            (currentJob.pidStartTime ?? null) === (job.pidStartTime ?? null);
+          if (!sameIdentity) {
+            return;
+          }
+
+          const timestamp = nowIso();
+          writeJobFileUnlocked(
+            cwd,
+            job.id,
+            {
+              ...currentJob,
+              status: "failed",
+              phase: "failed",
+              pid: null,
+              completedAt: timestamp,
+              updatedAt: timestamp,
+              errorMessage: "Process exited without writing a terminal state."
+            },
+            { beforeRename: revalidateLock }
+          );
+          reconciledIds.push(job.id);
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warnings.push(makeReconcileWarning(job?.id ?? null, normalizePid(job?.pid), "reconcile-error", message));
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      reconciledIds: [],
+      warnings: [makeReconcileWarning(null, null, "reconcile-error", message)]
+    };
+  }
+
+  return { reconciledIds, warnings };
+}
+
 export function setConfig(cwd, key, value) {
   return updateState(cwd, (state) => {
     state.config = {
@@ -815,7 +1035,7 @@ export function getConfig(cwd) {
   return loadState(cwd).config;
 }
 
-function writeJobFileUnlocked(cwd, jobId, payload, options = undefined) {
+export function writeJobFileUnlocked(cwd, jobId, payload, options = undefined) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
   atomicWriteJsonFile(jobFile, payload, options);

@@ -2,7 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob } from "./state.mjs";
+import {
+  readJobFile,
+  readPidStartTime,
+  resolveJobFile,
+  resolveJobLogFile,
+  upsertJob,
+  withJobLock,
+  writeJobFileUnlocked
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const TRANSIENT_APPEND_ERROR_CODES = new Set(["EACCES", "EBUSY", "EAGAIN", "EPERM", "EMFILE", "ENFILE", "EINTR"]);
@@ -251,19 +259,77 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  upsertJob(job.workspaceRoot, runningRecord);
+  let runningRecord = null;
+  let aborted = null;
+  let abortedLogFile = null;
+
+  withJobLock(job.workspaceRoot, job.id, (revalidateLock) => {
+    const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+    let existing = null;
+    try {
+      existing = readJobFile(jobFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    if (existing && ["completed", "failed", "cancelled"].includes(existing.status)) {
+      const terminalStatus = existing.status;
+      aborted = {
+        aborted: true,
+        terminalStatus,
+        reason: "terminal-record-observed-on-initial-transition",
+        job: existing,
+        exitStatus: 0,
+        threadId: null,
+        turnId: null,
+        payload: {
+          aborted: true,
+          terminalStatus,
+          reason: "terminal-record-observed-on-initial-transition",
+          job: existing
+        },
+        rendered: `Cannot start: a job for this id is already terminal (${terminalStatus}).\n`,
+        summary: "Worker aborted: record was already terminal."
+      };
+      abortedLogFile = options.logFile ?? existing.logFile ?? job.logFile ?? null;
+      return;
+    }
+
+    const baseRecord = existing ?? job;
+    const timestamp = nowIso();
+    runningRecord = {
+      ...baseRecord,
+      id: job.id,
+      status: "running",
+      phase: "starting",
+      pid: process.pid,
+      pidStartTime: readPidStartTime(process.pid),
+      pidStartedAtMs: Date.now(),
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      logFile: options.logFile ?? baseRecord.logFile ?? job.logFile ?? null
+    };
+    writeJobFileUnlocked(job.workspaceRoot, job.id, runningRecord, { beforeRename: revalidateLock });
+  });
+
+  if (aborted) {
+    try {
+      appendLogLine(
+        abortedLogFile,
+        `Worker aborted: record was already terminal (${aborted.terminalStatus}) when worker tried to take over.`
+      );
+    } catch {
+      // Best-effort breadcrumb only.
+    }
+    return aborted;
+  }
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    const noOp = execution?.noOp === true;
+    const completionStatus = execution.exitStatus === 0 && !noOp ? "completed" : "failed";
     const completedAt = nowIso();
     upsertJob(job.workspaceRoot, {
       ...runningRecord,
@@ -275,7 +341,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt,
       summary: execution.summary,
       result: execution.payload,
-      rendered: execution.rendered
+      rendered: execution.rendered,
+      ...(noOp ? { noOp: true, errorMessage: "Codex completed with no output and no changes." } : {})
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;

@@ -177,3 +177,19 @@ Concretely, in `plugins/codex/scripts/lib/tracked-jobs.mjs`:
   This would amortize the open cost but introduces fd-lifecycle
   complexity (crash leaks, log rotation hand-off). Not justified by
   current evidence.
+
+## Update (2026-05-30)
+
+Extended by [ADR 0005](0005-pid-liveness-and-no-op-detection.md).
+
+This ADR's "Consequences → Positive" claim that *"`jobs/{id}.json`
+writes still go through `upsertJob` → per-job lock → atomic rename →
+terminal-stickiness"* was correct in spirit for routine writes but did
+not cover the bounded set of paths that write the job file directly
+via `withJobLock` + `writeJobFileUnlocked` (`deleteSessionJobs`,
+`pruneJobsOnDisk`, legacy `migrateLegacyJobs`, and — added by Issue
+#10 — `runTrackedJob`'s initial running transition and
+`reconcileStaleActiveJobs`'s terminalization step). See [ADR 0005 §
+ADR 0004 refinement](0005-pid-liveness-and-no-op-detection.md#adr-0004-refinement)
+for the formal inventory and the per-path terminal-stickiness story.
+The strictness guarantees themselves are unchanged.
