@@ -21,7 +21,17 @@ import {
   saveState,
   writeJobFileForTest,
   identityVerificationSupported,
-  upsertJob
+  upsertJob,
+  __resetEnvVarWarningsForTest,
+  resolveStaleTtlTaskMs,
+  resolveStaleTtlReviewMs,
+  resolveProgressTimeoutMs,
+  commitCancelTombstoneUnderLock,
+  applyStalenessUnderLock,
+  STALE_REASONS_CANONICAL_ORDER,
+  STALE_TTL_TASK_MS_DEFAULT,
+  STALE_TTL_REVIEW_MS_DEFAULT,
+  PROGRESS_TIMEOUT_MS_DEFAULT
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
@@ -914,6 +924,15 @@ test("deleteSessionJobs converts active session jobs to terminal cancelled recor
     phase: "working",
     pid: 12345,
     logFile,
+    progressUpdatedAt: "2026-01-01T00:00:00.000Z",
+    staleness: {
+      reasons: ["progress-stalled"],
+      detectedAt: "2026-01-01T00:05:00.000Z",
+      ageMs: 300_000,
+      lastProgressMs: Date.parse("2026-01-01T00:00:00.000Z"),
+      ttlMs: 3_600_000,
+      progressTimeoutMs: 300_000
+    },
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z"
   });
@@ -927,6 +946,8 @@ test("deleteSessionJobs converts active session jobs to terminal cancelled recor
   assert.equal(cancelled.errorMessage, "Cancelled by session end.");
   assert.equal(cancelled.completedAt, cancelled.cancelledAt);
   assert.equal(Number.isFinite(Date.parse(cancelled.cancelledAt)), true);
+  assert.equal(cancelled.staleness, null);
+  assert.equal(cancelled.progressUpdatedAt, null);
   assert.equal(fs.existsSync(logFile), true);
 
   upsertJob(workspace, {
@@ -1885,6 +1906,15 @@ test("reconcileStaleActiveJobs marks an active job failed when the recorded pid 
     phase: "working",
     pid,
     pidStartTime: "stale-process",
+    progressUpdatedAt: "2026-01-01T00:00:00.000Z",
+    staleness: {
+      reasons: ["progress-stalled"],
+      detectedAt: "2026-01-01T00:05:00.000Z",
+      ageMs: 300_000,
+      lastProgressMs: Date.parse("2026-01-01T00:00:00.000Z"),
+      ttlMs: 3_600_000,
+      progressTimeoutMs: 300_000
+    },
     createdAt: timestamp,
     updatedAt: timestamp
   });
@@ -1899,6 +1929,8 @@ test("reconcileStaleActiveJobs marks an active job failed when the recorded pid 
   assert.equal(stored.pid, null);
   assert.equal(stored.errorMessage, "Process exited without writing a terminal state.");
   assert.equal(Number.isFinite(Date.parse(stored.completedAt)), true);
+  assert.equal(stored.staleness, null);
+  assert.equal(stored.progressUpdatedAt, null);
 });
 
 test("reconcileStaleActiveJobs leaves a live job unchanged when pidStartTime matches", () => {
@@ -1924,7 +1956,7 @@ test("reconcileStaleActiveJobs leaves a live job unchanged when pidStartTime mat
 
   const result = reconcileStaleActiveJobs(workspace);
 
-  assert.deepEqual(result, { reconciledIds: [], warnings: [] });
+  assert.deepEqual(result, { reconciledIds: [], warnings: [], staleIds: [] });
   assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
 });
 
@@ -2040,7 +2072,7 @@ test("reconcileStaleActiveJobs leaves a queued null-pid job inside the startup g
 
   const result = reconcileStaleActiveJobs(workspace);
 
-  assert.deepEqual(result, { reconciledIds: [], warnings: [] });
+  assert.deepEqual(result, { reconciledIds: [], warnings: [], staleIds: [] });
   assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
 });
 
@@ -2084,7 +2116,7 @@ test("reconcileStaleActiveJobs leaves terminal jobs unchanged", () => {
 
   const result = reconcileStaleActiveJobs(workspace);
 
-  assert.deepEqual(result, { reconciledIds: [], warnings: [] });
+  assert.deepEqual(result, { reconciledIds: [], warnings: [], staleIds: [] });
   assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
 });
 
@@ -2430,6 +2462,183 @@ test("classifyCancelIdentity returns platform-unverifiable on non-Linux", () => 
   }
 });
 
+test("commitCancelTombstoneUnderLock writes cancelled tombstone atomically for active+stale+match identity", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-match";
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const pidStartTime = readPidStartTime(process.pid);
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: process.pid,
+    pidStartTime,
+    threadId: "thread-1",
+    turnId: "turn-1",
+    staleness: { reasons: ["ttl-exceeded"], detectedAt: staleStartedAt }
+  });
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+
+  assert.equal(result.outcome, "committed");
+  assert.equal(result.identity.kind, "match");
+  assert.equal(result.signalRequired, true);
+  assert.equal(result.pid, process.pid);
+  assert.equal(result.pidStartTime, pidStartTime);
+  assert.equal(result.threadId, "thread-1");
+  assert.equal(result.turnId, "turn-1");
+  const record = readStoredJob(workspace, jobId);
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.phase, "cancelled");
+  assert.equal(record.pid, null);
+  assert.equal(record.cancelledAt, result.renderedJob.cancelledAt);
+  assert.equal(record.completedAt, result.renderedJob.completedAt);
+  assert.equal(record.errorMessage, "Cancelled by user.");
+  assert.equal(record.staleness, null);
+  assert.equal(record.progressUpdatedAt, null);
+});
+
+test("commitCancelTombstoneUnderLock skips when job is no longer active", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-terminal-skip";
+  const timestamp = new Date(Date.now() - 4_000_000).toISOString();
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    startedAt: timestamp,
+    progressUpdatedAt: timestamp,
+    completedAt: timestamp,
+    pid: process.pid,
+    pidStartTime: readPidStartTime(process.pid),
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+
+  assert.equal(result.outcome, "skipped");
+  assert.match(result.reason, /already completed/);
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("commitCancelTombstoneUnderLock skips when job is no longer stale", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-fresh-skip";
+  const timestamp = new Date().toISOString();
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: timestamp,
+    progressUpdatedAt: timestamp,
+    pid: process.pid,
+    pidStartTime: readPidStartTime(process.pid)
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+
+  assert.equal(result.outcome, "skipped");
+  assert.equal(result.reason, "Job is no longer stale.");
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("commitCancelTombstoneUnderLock skips unverifiable when force=false and does not mutate disk", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-unverifiable-skip";
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: process.pid,
+    pidStartTime: null
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+
+  assert.equal(result.outcome, "skipped");
+  assert.equal(result.identity.kind, "unverifiable");
+  assert.match(result.reason, /PID identity unverifiable/);
+  assert.match(result.reason, /\/codex:cancel --all-stale --force/);
+  assert.match(result.reason, new RegExp(`/codex:cancel --force ${jobId}`));
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("commitCancelTombstoneUnderLock commits and reports signalRequired for unverifiable when force=true", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-unverifiable-force";
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: process.pid,
+    pidStartTime: null
+  });
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: true });
+
+  assert.equal(result.outcome, "committed");
+  assert.equal(result.identity.kind, "unverifiable");
+  assert.equal(result.signalRequired, true);
+  assert.equal(result.pid, process.pid);
+  const record = readStoredJob(workspace, jobId);
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.pid, null);
+});
+
+test("commitCancelTombstoneUnderLock preserves tombstone against a late worker update via preserveTerminalJob", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-late-worker";
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const pidStartTime = readPidStartTime(process.pid);
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: process.pid,
+    pidStartTime
+  });
+
+  const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+  assert.equal(result.outcome, "committed");
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    completedAt: new Date().toISOString(),
+    result: { summary: "late worker result" },
+    rendered: "late worker rendered",
+    pid: 999999,
+    pidStartTime: "late-pid-start",
+    progressUpdatedAt: new Date().toISOString()
+  });
+
+  const record = readStoredJob(workspace, jobId);
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.phase, "cancelled");
+  assert.equal(record.cancelledAt, result.renderedJob.cancelledAt);
+  assert.equal(record.completedAt, result.renderedJob.completedAt);
+  assert.equal(record.errorMessage, "Cancelled by user.");
+  assert.equal(record.pid, null);
+  assert.equal(record.pidStartTime, pidStartTime);
+  assert.equal(record.staleness, null);
+  assert.equal(record.progressUpdatedAt, null);
+});
+
 // ---------------------------------------------------------------------------
 // Cancel-patch sparseness: upsertJob preserves worker-written fields when the
 // cancel patch only carries cancellation-owned fields (regression for the
@@ -2486,4 +2695,826 @@ test("upsertJob preserves worker-written fields when cancel patch is sparse", ()
   assert.equal(returned.logFile, "/tmp/logs/task-cancel-sparse.log");
   assert.equal(returned.title, "background task");
   assert.equal(returned.kind, "task");
+});
+
+// ─── Unit 1: stale-job detection tests ───────────────────────────────────────
+
+// ---- Env-var parsers --------------------------------------------------------
+
+test("resolveStaleTtlTaskMs returns default when env var unset", () => {
+  __resetEnvVarWarningsForTest();
+  const env = {};
+  assert.equal(resolveStaleTtlTaskMs(env), STALE_TTL_TASK_MS_DEFAULT);
+});
+
+test("resolveStaleTtlTaskMs returns parsed value for valid integer string", () => {
+  __resetEnvVarWarningsForTest();
+  const env = { CODEX_PLUGIN_STALE_TTL_TASK_MS: "120000" };
+  assert.equal(resolveStaleTtlTaskMs(env), 120000);
+});
+
+test("resolveStaleTtlTaskMs falls back to default for invalid values", () => {
+  for (const val of ["abc", "", "-5", "+60000", "0", "3.14", "60000.0", "1e5", "0x10000", "NaN", "Infinity", " 60000 ", "59999", "86400001"]) {
+    __resetEnvVarWarningsForTest();
+    const env = { CODEX_PLUGIN_STALE_TTL_TASK_MS: val };
+    assert.equal(resolveStaleTtlTaskMs(env), STALE_TTL_TASK_MS_DEFAULT, `expected default for "${val}"`);
+  }
+});
+
+test("resolveStaleTtlTaskMs emits warning exactly once per env var name", () => {
+  __resetEnvVarWarningsForTest();
+  const stderrLines = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...args) => {
+    stderrLines.push(String(chunk));
+    return originalWrite(chunk, ...args);
+  };
+  try {
+    const env = { CODEX_PLUGIN_STALE_TTL_TASK_MS: "bad" };
+    resolveStaleTtlTaskMs(env);
+    resolveStaleTtlTaskMs(env);
+    resolveStaleTtlTaskMs(env);
+    const warnings = stderrLines.filter(l => l.includes("CODEX_PLUGIN_STALE_TTL_TASK_MS"));
+    assert.equal(warnings.length, 1);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+test("resolveStaleTtlReviewMs returns default when env var unset", () => {
+  __resetEnvVarWarningsForTest();
+  assert.equal(resolveStaleTtlReviewMs({}), STALE_TTL_REVIEW_MS_DEFAULT);
+});
+
+test("resolveStaleTtlReviewMs returns parsed value for valid integer string", () => {
+  __resetEnvVarWarningsForTest();
+  assert.equal(resolveStaleTtlReviewMs({ CODEX_PLUGIN_STALE_TTL_REVIEW_MS: "120000" }), 120000);
+});
+
+test("resolveStaleTtlReviewMs falls back to default for invalid values", () => {
+  for (const val of ["abc", "", "-5", "+60000", "0", "3.14", "60000.0", "1e5", "0x10000", "NaN", "Infinity", " 60000 ", "59999", "86400001"]) {
+    __resetEnvVarWarningsForTest();
+    assert.equal(resolveStaleTtlReviewMs({ CODEX_PLUGIN_STALE_TTL_REVIEW_MS: val }), STALE_TTL_REVIEW_MS_DEFAULT, `expected default for "${val}"`);
+  }
+});
+
+test("resolveProgressTimeoutMs returns default when env var unset", () => {
+  __resetEnvVarWarningsForTest();
+  assert.equal(resolveProgressTimeoutMs({}), PROGRESS_TIMEOUT_MS_DEFAULT);
+});
+
+test("resolveProgressTimeoutMs returns parsed value for valid integer string", () => {
+  __resetEnvVarWarningsForTest();
+  assert.equal(resolveProgressTimeoutMs({ CODEX_PLUGIN_PROGRESS_TIMEOUT_MS: "60000" }), 60000);
+});
+
+test("resolveProgressTimeoutMs falls back to default for invalid values", () => {
+  for (const val of ["abc", "", "-5", "+60000", "0", "3.14", "60000.0", "1e5", "0x10000", "NaN", "Infinity", " 60000 ", "29999", "3600001"]) {
+    __resetEnvVarWarningsForTest();
+    assert.equal(resolveProgressTimeoutMs({ CODEX_PLUGIN_PROGRESS_TIMEOUT_MS: val }), PROGRESS_TIMEOUT_MS_DEFAULT, `expected default for "${val}"`);
+  }
+});
+
+test("resolveProgressTimeoutMs emits warning exactly once per env var name", () => {
+  __resetEnvVarWarningsForTest();
+  const stderrLines = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...args) => {
+    stderrLines.push(String(chunk));
+    return originalWrite(chunk, ...args);
+  };
+  try {
+    const env = { CODEX_PLUGIN_PROGRESS_TIMEOUT_MS: "bad" };
+    resolveProgressTimeoutMs(env);
+    resolveProgressTimeoutMs(env);
+    const warnings = stderrLines.filter(l => l.includes("CODEX_PLUGIN_PROGRESS_TIMEOUT_MS"));
+    assert.equal(warnings.length, 1);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+// ---- applyStalenessUnderLock ------------------------------------------------
+
+test("applyStalenessUnderLock: terminal record → no write", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-term-test";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    startedAt: new Date(Date.now() - 10_000_000).toISOString(),
+    pid: 9999,
+    pidStartTime: "12345"
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+  const snapshot = { pid: 9999, pidStartTime: "12345", ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, false);
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("applyStalenessUnderLock: pid mismatch → no write", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-pidmatch";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 10_000_000).toISOString(),
+    pid: 1111,
+    pidStartTime: "12345"
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+  const snapshot = { pid: 9999, pidStartTime: "12345", ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, false);
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("applyStalenessUnderLock: pidStartTime mismatch → no write", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-pidstm";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 10_000_000).toISOString(),
+    pid: 1111,
+    pidStartTime: "OLD"
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+  const snapshot = { pid: 1111, pidStartTime: "NEW", ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, false);
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("applyStalenessUnderLock: no stale reasons AND staleness already null → no write", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-nullnull";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 100).toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const before = fs.readFileSync(resolveJobFile(workspace, jobId), "utf8");
+  const snapshot = { pid: null, pidStartTime: null, ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, false);
+  assert.equal(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"), before);
+});
+
+test("applyStalenessUnderLock: same reasons already present → no write", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-samereasons";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 10_000_000).toISOString(),
+    pid: null,
+    pidStartTime: null,
+    staleness: { reasons: ["ttl-exceeded", "progress-stalled"], detectedAt: new Date().toISOString(), ageMs: 1000, lastProgressMs: null, ttlMs: 3_600_000, progressTimeoutMs: 300_000 }
+  });
+  const snapshot = { pid: null, pidStartTime: null, ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, false);
+});
+
+test("applyStalenessUnderLock: normal write case sets staleness with correct shape", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-write";
+  const startedAt = new Date(Date.now() - 10_000_000).toISOString();
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: new Date().toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const snapshot = { pid: null, pidStartTime: null, ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, true);
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.ok(record.staleness != null);
+  assert.deepEqual(record.staleness.reasons, ["ttl-exceeded"]);
+  assert.ok(typeof record.staleness.detectedAt === "string");
+  assert.ok(typeof record.staleness.ageMs === "number");
+  assert.equal(record.staleness.ttlMs, 3_600_000);
+  assert.equal(record.staleness.progressTimeoutMs, 300_000);
+});
+
+test("applyStalenessUnderLock: clear case writes staleness: null", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-clear";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 100).toISOString(),
+    pid: null,
+    pidStartTime: null,
+    staleness: { reasons: ["ttl-exceeded"], detectedAt: new Date().toISOString(), ageMs: 1000, lastProgressMs: null, ttlMs: 3_600_000, progressTimeoutMs: 300_000 }
+  });
+  const snapshot = { pid: null, pidStartTime: null, ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  const result = applyStalenessUnderLock(workspace, jobId, snapshot);
+  assert.equal(result.wrote, true);
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(record.staleness, null);
+});
+
+// ---- reconcileStaleActiveJobs stale detection --------------------------------
+
+test("reconcileStaleActiveJobs: fresh job not flagged as stale", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-fresh-job";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date().toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.deepEqual(result.staleIds, []);
+  assert.deepEqual(result.reconciledIds, []);
+});
+
+test("reconcileStaleActiveJobs: progress-stalled when progressUpdatedAt old", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-progress-stall";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date().toISOString(),
+    progressUpdatedAt: new Date(Date.now() - 400_000).toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.ok(result.staleIds.includes(jobId));
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.deepEqual(record.staleness.reasons, ["progress-stalled"]);
+});
+
+test("reconcileStaleActiveJobs: skips obsolete stale tag when progress updates before lock", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-progress-race";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const startedAt = new Date(Date.now() - 600_000).toISOString();
+  const oldProgress = new Date(Date.now() - 400_000).toISOString();
+  const initialUpdatedAt = new Date(Date.now() - 10_000).toISOString();
+  const freshProgress = new Date().toISOString();
+  const freshUpdatedAt = new Date(Date.now() + 1_000).toISOString();
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: oldProgress,
+    pid: null,
+    pidStartTime: null,
+    createdAt: startedAt,
+    updatedAt: initialUpdatedAt
+  });
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let mutated = false;
+  fs.readFileSync = function (file, ...args) {
+    const result = originalReadFileSync.call(fs, file, ...args);
+    if (!mutated && path.resolve(String(file)) === path.resolve(jobFile)) {
+      mutated = true;
+      const staleSnapshot = JSON.parse(String(result));
+      originalWriteFileSync.call(
+        fs,
+        jobFile,
+        `${JSON.stringify(
+          {
+            ...staleSnapshot,
+            progressUpdatedAt: freshProgress,
+            updatedAt: freshUpdatedAt,
+            staleness: null
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      );
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = reconcileStaleActiveJobs(workspace, {
+      ttlTaskMs: STALE_TTL_TASK_MS_DEFAULT,
+      ttlReviewMs: STALE_TTL_REVIEW_MS_DEFAULT,
+      progressTimeoutMs: PROGRESS_TIMEOUT_MS_DEFAULT
+    });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(mutated, true);
+  assert.equal(result.staleIds.includes(jobId), false);
+  const record = readStoredJob(workspace, jobId);
+  assert.equal(record.updatedAt, freshUpdatedAt);
+  assert.equal(record.progressUpdatedAt, freshProgress);
+  assert.equal(record.staleness?.reasons?.includes("progress-stalled") ?? false, false);
+});
+
+test("reconcileStaleActiveJobs: ttl stale job remains stale when updatedAt changes before lock", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-ttl-updatedat-race";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const startedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const freshProgress = new Date().toISOString();
+  const initialUpdatedAt = new Date(Date.now() - 10_000).toISOString();
+  const freshUpdatedAt = new Date(Date.now() - 1_000).toISOString();
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: freshProgress,
+    pid: null,
+    pidStartTime: null,
+    createdAt: startedAt,
+    updatedAt: initialUpdatedAt
+  });
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let mutated = false;
+  fs.readFileSync = function (file, ...args) {
+    const result = originalReadFileSync.call(fs, file, ...args);
+    if (!mutated && path.resolve(String(file)) === path.resolve(jobFile)) {
+      mutated = true;
+      const staleSnapshot = JSON.parse(String(result));
+      originalWriteFileSync.call(
+        fs,
+        jobFile,
+        `${JSON.stringify(
+          {
+            ...staleSnapshot,
+            progressUpdatedAt: freshProgress,
+            updatedAt: freshUpdatedAt,
+            staleness: null
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      );
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = reconcileStaleActiveJobs(workspace, {
+      ttlTaskMs: STALE_TTL_TASK_MS_DEFAULT,
+      ttlReviewMs: STALE_TTL_REVIEW_MS_DEFAULT,
+      progressTimeoutMs: PROGRESS_TIMEOUT_MS_DEFAULT
+    });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(mutated, true);
+  assert.equal(result.staleIds.includes(jobId), true);
+  const record = readStoredJob(workspace, jobId);
+  assert.deepEqual(record.staleness.reasons, ["ttl-exceeded"]);
+  assert.notEqual(record.updatedAt, initialUpdatedAt);
+});
+
+test("reconcileStaleActiveJobs: locked job class decides TTL after class race", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-class-race-review-ttl";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const startedAt = new Date(Date.now() - 1_000_000).toISOString();
+  const recentProgress = new Date().toISOString();
+  const initialUpdatedAt = new Date(Date.now() - 10_000).toISOString();
+  const freshUpdatedAt = new Date(Date.now() - 1_000).toISOString();
+  const pidStartTime = readPidStartTime(process.pid);
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    jobClass: "task",
+    kind: "task",
+    startedAt,
+    progressUpdatedAt: recentProgress,
+    pid: process.pid,
+    pidStartTime,
+    createdAt: startedAt,
+    updatedAt: initialUpdatedAt
+  });
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let mutated = false;
+  fs.readFileSync = function (file, ...args) {
+    const result = originalReadFileSync.call(fs, file, ...args);
+    if (!mutated && path.resolve(String(file)) === path.resolve(jobFile)) {
+      mutated = true;
+      const staleSnapshot = JSON.parse(String(result));
+      originalWriteFileSync.call(
+        fs,
+        jobFile,
+        `${JSON.stringify(
+          {
+            ...staleSnapshot,
+            jobClass: "review",
+            kind: "adversarial-review",
+            updatedAt: freshUpdatedAt,
+            staleness: null
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      );
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = reconcileStaleActiveJobs(workspace, {
+      ttlTaskMs: STALE_TTL_TASK_MS_DEFAULT,
+      ttlReviewMs: STALE_TTL_REVIEW_MS_DEFAULT,
+      progressTimeoutMs: PROGRESS_TIMEOUT_MS_DEFAULT
+    });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(mutated, true);
+  assert.equal(result.staleIds.includes(jobId), true);
+  const record = readStoredJob(workspace, jobId);
+  assert.deepEqual(record.staleness.reasons, ["ttl-exceeded"]);
+  assert.equal(record.staleness.ttlMs, STALE_TTL_REVIEW_MS_DEFAULT);
+});
+
+test("reconcileStaleActiveJobs: locked per-job progress timeout wins after timeout race", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-progress-timeout-race";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const startedAt = new Date().toISOString();
+  const oldProgress = new Date(Date.now() - 400_000).toISOString();
+  const initialUpdatedAt = new Date(Date.now() - 10_000).toISOString();
+  const freshUpdatedAt = new Date(Date.now() - 1_000).toISOString();
+  const pidStartTime = readPidStartTime(process.pid);
+
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: oldProgress,
+    pid: process.pid,
+    pidStartTime,
+    createdAt: startedAt,
+    updatedAt: initialUpdatedAt
+  });
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let mutated = false;
+  fs.readFileSync = function (file, ...args) {
+    const result = originalReadFileSync.call(fs, file, ...args);
+    if (!mutated && path.resolve(String(file)) === path.resolve(jobFile)) {
+      mutated = true;
+      const staleSnapshot = JSON.parse(String(result));
+      originalWriteFileSync.call(
+        fs,
+        jobFile,
+        `${JSON.stringify(
+          {
+            ...staleSnapshot,
+            progressTimeoutMs: 600_000,
+            updatedAt: freshUpdatedAt,
+            staleness: null
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      );
+    }
+    return result;
+  };
+
+  let result;
+  try {
+    result = reconcileStaleActiveJobs(workspace, {
+      ttlTaskMs: STALE_TTL_TASK_MS_DEFAULT,
+      ttlReviewMs: STALE_TTL_REVIEW_MS_DEFAULT,
+      progressTimeoutMs: PROGRESS_TIMEOUT_MS_DEFAULT
+    });
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  assert.equal(mutated, true);
+  assert.equal(result.staleIds.includes(jobId), false);
+  const record = readStoredJob(workspace, jobId);
+  assert.equal(record.progressTimeoutMs, 600_000);
+  assert.equal(record.staleness, null);
+});
+
+test("reconcileStaleActiveJobs: ttl-exceeded when startedAt old", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-ttl-exceeded";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 4_000_000).toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.ok(result.staleIds.includes(jobId));
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.ok(record.staleness.reasons.includes("ttl-exceeded"));
+});
+
+test("reconcileStaleActiveJobs: both exceeded → canonical order reasons", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-both-stale";
+  const startedAt = new Date(Date.now() - 4_000_000).toISOString();
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: new Date(Date.now() - 400_000).toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.ok(result.staleIds.includes(jobId));
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.deepEqual(record.staleness.reasons, ["ttl-exceeded", "progress-stalled"]);
+});
+
+test("reconcileStaleActiveJobs: unverifiable-identity record also gets staleness reasons", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-unverifiable";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 4_000_000).toISOString(),
+    // No pid or pidStartTime — unverifiable
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.ok(result.staleIds.includes(jobId));
+});
+
+test("reconcileStaleActiveJobs: return shape includes staleIds array", () => {
+  const workspace = makeTempDir();
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.ok(Array.isArray(result.staleIds));
+  assert.ok(Array.isArray(result.reconciledIds));
+  assert.ok(Array.isArray(result.warnings));
+});
+
+test("reconcileStaleActiveJobs: per-job progressTimeoutMs wins over env default", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-per-job-timeout";
+  // progressUpdatedAt is 400s ago — would be stale at default 300s
+  // but job has custom progressTimeoutMs of 600s → should NOT be stale
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date().toISOString(),
+    progressUpdatedAt: new Date(Date.now() - 400_000).toISOString(),
+    progressTimeoutMs: 600_000,
+    pid: null,
+    pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  assert.equal(result.staleIds.includes(jobId), false);
+});
+
+test("reconcileStaleActiveJobs: review job uses review TTL", () => {
+  const workspace = makeTempDir();
+  const taskJobId = "task-ttl-check";
+  const reviewJobId = "review-ttl-check";
+  // Both are 1,000,000ms old — exceeds review TTL (900s) but not task TTL (3600s)
+  // Set progressUpdatedAt to now so neither is progress-stalled; TTL is the only differentiator
+  const recentProgress = new Date().toISOString();
+  upsertJob(workspace, {
+    id: taskJobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 1_000_000).toISOString(),
+    progressUpdatedAt: recentProgress,
+    pid: null, pidStartTime: null
+  });
+  upsertJob(workspace, {
+    id: reviewJobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 1_000_000).toISOString(),
+    progressUpdatedAt: recentProgress,
+    kind: "adversarial-review",
+    pid: null, pidStartTime: null
+  });
+  const result = reconcileStaleActiveJobs(workspace);
+  // Review job should be stale (age > 900s TTL), task job should not (age < 3600s TTL)
+  assert.equal(result.staleIds.includes(reviewJobId), true);
+  assert.equal(result.staleIds.includes(taskJobId), false);
+});
+
+test("reconcileStaleActiveJobs: kind review without jobClass uses review TTL", () => {
+  const workspace = makeTempDir();
+  const taskJobId = "task-kind-review-ttl-check";
+  const reviewJobId = "legacy-kind-review-ttl-check";
+  const recentProgress = new Date().toISOString();
+  const startedAt = new Date(Date.now() - 1_000_000).toISOString();
+
+  upsertJob(workspace, {
+    id: taskJobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: recentProgress,
+    pid: null,
+    pidStartTime: null
+  });
+  upsertJob(workspace, {
+    id: reviewJobId,
+    status: "running",
+    phase: "running",
+    startedAt,
+    progressUpdatedAt: recentProgress,
+    kind: "review",
+    pid: null,
+    pidStartTime: null
+  });
+
+  const result = reconcileStaleActiveJobs(workspace);
+  const reviewRecord = readStoredJob(workspace, reviewJobId);
+  const taskRecord = readStoredJob(workspace, taskJobId);
+
+  assert.equal(result.staleIds.includes(reviewJobId), true);
+  assert.equal(result.staleIds.includes(taskJobId), false);
+  assert.deepEqual(reviewRecord.staleness.reasons, ["ttl-exceeded"]);
+  assert.equal(taskRecord.staleness, undefined);
+});
+
+// ---- TERMINAL_STICKY_FIELDS side-effects ------------------------------------
+
+test("progressTimeoutMs survives terminal upsert (TERMINAL_STICKY_FIELDS)", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-sticky-progress-timeout";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    progressTimeoutMs: 600_000,
+    startedAt: new Date().toISOString(),
+    pid: 1234,
+    pidStartTime: "9999"
+  });
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    completedAt: new Date().toISOString()
+  });
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(record.progressTimeoutMs, 600_000);
+});
+
+test("staleness does NOT survive terminal upsert (not in TERMINAL_STICKY_FIELDS)", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-no-sticky-staleness";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    staleness: { reasons: ["ttl-exceeded"], detectedAt: new Date().toISOString(), ageMs: 1000, lastProgressMs: null, ttlMs: 3_600_000, progressTimeoutMs: 300_000 },
+    startedAt: new Date().toISOString(),
+    pid: 1234,
+    pidStartTime: "9999"
+  });
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    completedAt: new Date().toISOString()
+  });
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(record.staleness, null);
+});
+
+test("progressUpdatedAt does NOT survive terminal upsert (not in TERMINAL_STICKY_FIELDS)", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-no-sticky-progressupdatedat";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    progressUpdatedAt: new Date().toISOString(),
+    startedAt: new Date().toISOString(),
+    pid: 1234,
+    pidStartTime: "9999"
+  });
+  upsertJob(workspace, {
+    id: jobId,
+    status: "completed",
+    phase: "done",
+    completedAt: new Date().toISOString()
+  });
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(record.progressUpdatedAt, null);
+});
+
+test("reconcileStaleActiveJobs honors CODEX_PLUGIN_STALE_TTL_TASK_MS via env", () => {
+  __resetEnvVarWarningsForTest();
+  const workspace = makeTempDir();
+  const recentlyStarted = new Date(Date.now() - 120_000).toISOString(); // 2 min old
+  upsertJob(workspace, {
+    id: "task-env-ttl",
+    status: "running",
+    phase: "running",
+    title: "t",
+    startedAt: recentlyStarted,
+    progressUpdatedAt: recentlyStarted,
+    pid: process.pid,
+    pidStartTime: readPidStartTime(process.pid)
+  });
+
+  const originalEnv = process.env.CODEX_PLUGIN_STALE_TTL_TASK_MS;
+  try {
+    delete process.env.CODEX_PLUGIN_STALE_TTL_TASK_MS;
+    reconcileStaleActiveJobs(workspace);
+    const job1 = readStoredJob(workspace, "task-env-ttl");
+    assert.equal(job1.staleness?.reasons?.includes("ttl-exceeded") ?? false, false, "default TTL must not mark fresh job as ttl-exceeded");
+
+    process.env.CODEX_PLUGIN_STALE_TTL_TASK_MS = "60000";
+    reconcileStaleActiveJobs(workspace);
+    const job2 = readStoredJob(workspace, "task-env-ttl");
+    assert.ok(job2.staleness?.reasons?.includes("ttl-exceeded"), "env-overridden TTL must mark older job as ttl-exceeded");
+  } finally {
+    if (originalEnv === undefined) {
+      delete process.env.CODEX_PLUGIN_STALE_TTL_TASK_MS;
+    } else {
+      process.env.CODEX_PLUGIN_STALE_TTL_TASK_MS = originalEnv;
+    }
+  }
+});
+
+test("reconcileStaleActiveJobs honors CODEX_PLUGIN_STALE_TTL_REVIEW_MS via env", () => {
+  __resetEnvVarWarningsForTest();
+  const workspace = makeTempDir();
+  const recentlyStarted = new Date(Date.now() - 120_000).toISOString();
+  upsertJob(workspace, {
+    id: "review-env-ttl",
+    jobClass: "review",
+    status: "running",
+    phase: "running",
+    title: "r",
+    startedAt: recentlyStarted,
+    progressUpdatedAt: recentlyStarted,
+    pid: process.pid,
+    pidStartTime: readPidStartTime(process.pid)
+  });
+
+  const originalEnv = process.env.CODEX_PLUGIN_STALE_TTL_REVIEW_MS;
+  try {
+    delete process.env.CODEX_PLUGIN_STALE_TTL_REVIEW_MS;
+    reconcileStaleActiveJobs(workspace);
+    const job1 = readStoredJob(workspace, "review-env-ttl");
+    assert.equal(job1.staleness?.reasons?.includes("ttl-exceeded") ?? false, false);
+
+    process.env.CODEX_PLUGIN_STALE_TTL_REVIEW_MS = "60000";
+    reconcileStaleActiveJobs(workspace);
+    const job2 = readStoredJob(workspace, "review-env-ttl");
+    assert.ok(job2.staleness?.reasons?.includes("ttl-exceeded"));
+  } finally {
+    if (originalEnv === undefined) {
+      delete process.env.CODEX_PLUGIN_STALE_TTL_REVIEW_MS;
+    } else {
+      process.env.CODEX_PLUGIN_STALE_TTL_REVIEW_MS = originalEnv;
+    }
+  }
 });
