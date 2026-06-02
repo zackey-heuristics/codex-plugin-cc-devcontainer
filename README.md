@@ -1,18 +1,36 @@
-# Codex plugin for Claude Code
+# Codex plugin for Claude Code (devcontainer-hardened fork)
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex — with the rough edges around long-running jobs, devcontainer sandboxes, and resumed sessions sanded down.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+This is `openai-codex-devcontainer`, a fork of OpenAI's [`codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) targeted at Claude Code users running in devcontainer / Docker environments and at workflows that lean heavily on background jobs.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
+## Why this fork?
+
+The upstream plugin works well for short, foreground-driven Codex use. This fork closes the gaps that show up when you push Codex into long-running background work, multi-session days, and outer-sandboxed dev environments. Four concrete differences:
+
+- **Devcontainer-first sandboxing.** Codex's built-in Linux sandbox (bubblewrap / Landlock) collides with the outer sandbox in devcontainers and breaks `/codex:rescue`, `/codex:adversarial-review`, and task resume. This fork ships an opt-in turn-level `sandboxPolicy` override with a [decision guide](docs/devcontainer-sandbox-settings.md) for picking the right values per environment. See [Devcontainer / Externally Sandboxed Environments](#devcontainer--externally-sandboxed-environments) and [ADR 0001](docs/adr/0001-turn-level-sandbox-policy-for-task-flows.md).
+- **Stale-job recovery.** Long-running review records, wedged Codex turns, and queued workers whose host died used to permanently consume Codex's limited active-job capacity, producing the cryptic `no rollout found` on every new launch. This fork adds TTL + progress-timeout staleness classification, a `Stale` column in [`/codex:status`](#codexstatus), a workspace-wide [`/codex:cancel --all-stale`](#codexcancel) sweep, and SessionStart auto-reaping with a bounded lock budget — so a fresh Claude Code session doesn't inherit yesterday's blocked capacity. See [ADR 0006](docs/adr/0006-stale-job-detection-and-reaping.md).
+- **Identity-checked PID liveness reconciliation.** A `running` row whose worker died left a phantom that blocked new tasks; resumed Codex threads then hallucinated that the work was already underway. This fork records `pid` + `pidStartTime` at job start and reconciles dead workers identity-aware, so a same-user PID reuse cannot mask a dead worker as alive nor trick reconciliation into signalling an unrelated process. See [ADR 0005](docs/adr/0005-pid-liveness-and-no-op-detection.md).
+- **Review subagents enabled by default.** `/codex:setup` materializes the `codex-review` and `codex-adversarial-review` subagents on first run so `Stop` hooks, agent loops, and scheduled jobs can fire reviews programmatically out of the box. Pass `/codex:setup --disable-review-subagents` to opt out. The hardening — read-only tool surface, pinned `Bash(node:*)` call, invoker tagging, optional rate limit — is unchanged from upstream's design; only the default flips. See [Enabling review subagents](#enabling-review-subagents) and [ADR 0002](docs/adr/0002-opt-in-review-subagents-with-invoker-tagging.md).
+
+This fork tracks upstream Codex `1.0.4` as its base; the fork version `1.0.0+base.1.0.4` is the first stable release of the devcontainer-targeted track.
+
 ## What You Get
+
+Core commands (slash-command and subagent surface):
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
-- Opt-in [review subagents](#enabling-review-subagents) so `Stop` hooks, agent loops, and scheduled jobs can fire `/codex:review` and `/codex:adversarial-review` programmatically — disabled by default
+- `/codex:setup` to install / authenticate Codex and toggle plugin features
+
+Fork-only conveniences:
+
+- A `Stale` column in `/codex:status` and a `/codex:cancel --all-stale` sweep so blocked capacity is recoverable from the same surface you already use
+- Automatic dead-job reaping and stale tagging on every SessionStart (with a bounded lock budget so the hook never kills Claude Code startup)
+- Materialized review subagents enabled by default (opt out with `--disable-review-subagents`), so `Stop` hooks and scheduled jobs can fire `/codex:review` / `/codex:adversarial-review` programmatically
 - Opt-in turn-level `sandboxPolicy` forwarding for [devcontainer and other externally sandboxed environments](#devcontainer--externally-sandboxed-environments)
 
 ## Requirements
@@ -65,7 +83,7 @@ After install, you should see:
 
 - the slash commands listed below
 - the `codex:codex-rescue` subagent in `/agents`
-- `codex-review` and `codex-adversarial-review` subagents in `/agents` **only after** you opt in with `/codex:setup --enable-review-subagents` (see [Enabling review subagents](#enabling-review-subagents))
+- `codex-review` and `codex-adversarial-review` subagents in `/agents` — this fork's `/codex:setup` enables them by default (see [Enabling review subagents](#enabling-review-subagents)); opt out with `/codex:setup --disable-review-subagents`
 
 One simple first run is:
 
@@ -186,7 +204,9 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
-When [review subagents are enabled](#enabling-review-subagents), `/codex:status` also surfaces the `Invoker` column (`user-slash`, `claude-subagent`, `claude-bash`, `hook`) per review job and an aggregate line showing how many of the recent reviews were Claude-driven vs user-driven.
+When [review subagents are enabled](#enabling-review-subagents) — the default in this fork — `/codex:status` also surfaces the `Invoker` column (`user-slash`, `claude-subagent`, `claude-bash`, `hook`) per review job and an aggregate line showing how many of the recent reviews were Claude-driven vs user-driven.
+
+In this fork, the Active jobs table also gains a `Stale` column that renders the canonical staleness reasons (`ttl-exceeded`, `progress stalled`) for any record that crossed `CODEX_PLUGIN_STALE_TTL_TASK_MS` (default 1 h for task/rescue jobs), `CODEX_PLUGIN_STALE_TTL_REVIEW_MS` (default 15 min for review/adversarial-review jobs), or `CODEX_PLUGIN_PROGRESS_TIMEOUT_MS` (default 5 min since the last heartbeat). A `Stale jobs: N (see rows)` summary line counts the visible stale rows. To clear them in one shot, use [`/codex:cancel --all-stale`](#codexcancel). See [ADR 0006](docs/adr/0006-stale-job-detection-and-reaping.md).
 
 ### `/codex:result`
 
@@ -202,14 +222,19 @@ Examples:
 
 ### `/codex:cancel`
 
-Cancels an active background Codex job.
+Cancels an active background Codex job — by id, or sweep every stale job in the workspace with `--all-stale`.
 
 Examples:
 
 ```bash
-/codex:cancel
-/codex:cancel task-abc123
+/codex:cancel                          # cancel the current / most-recent job
+/codex:cancel task-abc123              # cancel a specific job
+/codex:cancel --all-stale              # cancel every job tagged stale (fork-only)
+/codex:cancel --all-stale --force      # override identity-verification skips
+/codex:cancel --all-stale --json       # machine-readable batch summary
 ```
+
+The `--all-stale` sweep is paired with the [`Stale` column in `/codex:status`](#codexstatus) and with the auto-tagging done by the SessionStart hook. It uses a two-phase tombstone + bounded interrupt race per job so a wedged Codex turn cannot deadlock the batch. See [ADR 0006](docs/adr/0006-stale-job-detection-and-reaping.md).
 
 ### `/codex:setup`
 
@@ -233,11 +258,15 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 #### Enabling review subagents
 
 ```bash
-/codex:setup --enable-review-subagents
-/codex:setup --disable-review-subagents
+/codex:setup                              # this fork enables review subagents by default
+/codex:setup --disable-review-subagents   # opt out (this fork)
+/codex:setup --enable-review-subagents    # explicit re-enable
 ```
 
-By default, `/codex:review` and `/codex:adversarial-review` are slash-command only (`disable-model-invocation: true`), so Claude cannot autonomously fire them. Enabling review subagents materializes two thin-wrapper subagents — `codex-review` and `codex-adversarial-review` — so power-user automation paths (`Stop` hooks, agent loops, scheduled reviews) can invoke reviews programmatically.
+> [!NOTE]
+> Upstream defaults review subagents to **off** and requires `--enable-review-subagents` to opt in. This fork inverts the default — a plain `/codex:setup` materializes them automatically — because the workflows this fork targets (devcontainer agents, scheduled `Stop` hooks, long-running rescue loops) need programmatic review access on day one. The hardening below is unchanged.
+
+By default in upstream, `/codex:review` and `/codex:adversarial-review` are slash-command only (`disable-model-invocation: true`), so Claude cannot autonomously fire them. Enabling review subagents materializes two thin-wrapper subagents — `codex-review` and `codex-adversarial-review` — so power-user automation paths (`Stop` hooks, agent loops, scheduled reviews) can invoke reviews programmatically.
 
 The materialized subagents are hardened by design:
 

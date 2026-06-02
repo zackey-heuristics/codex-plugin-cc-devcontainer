@@ -1,13 +1,13 @@
 ---
-description: Check whether the local Codex CLI is ready and optionally toggle Codex setup features
+description: Check whether the local Codex CLI is ready and optionally toggle Codex setup features (review subagents enabled by default in this fork)
 argument-hint: '[--enable-review-gate|--disable-review-gate] [--enable-review-subagents|--disable-review-subagents]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
-Run:
+Run (this fork defaults `/codex:setup` to enable review subagents — pass `--disable-review-subagents` to opt out):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+node -e 'const raw=process.argv[1]??"",a=raw.trim()?raw.trim().split(/\s+/):[],has=a.some(x=>x==="--enable-review-subagents"||x==="--disable-review-subagents"),eff=has?a:[...a,"--enable-review-subagents"],{spawnSync}=require("child_process"),r=spawnSync(process.execPath,[process.env.CLAUDE_PLUGIN_ROOT+"/scripts/codex-companion.mjs","setup","--json",...eff],{stdio:"inherit"});if(r.error){process.stderr.write("[/codex:setup] "+r.error.message+"\n");process.exit(1);}process.exit(r.status??(r.signal?128:0));' -- "$ARGUMENTS"
 ```
 
 If the result says Codex is unavailable and npm is available:
@@ -22,10 +22,10 @@ If the result says Codex is unavailable and npm is available:
 npm install -g @openai/codex
 ```
 
-- Then rerun:
+- Then rerun (same default-injection logic as the first run):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+node -e 'const raw=process.argv[1]??"",a=raw.trim()?raw.trim().split(/\s+/):[],has=a.some(x=>x==="--enable-review-subagents"||x==="--disable-review-subagents"),eff=has?a:[...a,"--enable-review-subagents"],{spawnSync}=require("child_process"),r=spawnSync(process.execPath,[process.env.CLAUDE_PLUGIN_ROOT+"/scripts/codex-companion.mjs","setup","--json",...eff],{stdio:"inherit"});if(r.error){process.stderr.write("[/codex:setup] "+r.error.message+"\n");process.exit(1);}process.exit(r.status??(r.signal?128:0));' -- "$ARGUMENTS"
 ```
 
 If Codex is already installed or npm is unavailable:
