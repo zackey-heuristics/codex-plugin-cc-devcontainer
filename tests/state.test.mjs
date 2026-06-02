@@ -28,10 +28,13 @@ import {
   resolveProgressTimeoutMs,
   commitCancelTombstoneUnderLock,
   applyStalenessUnderLock,
+  JobLockUnavailableError,
+  RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
   STALE_REASONS_CANONICAL_ORDER,
   STALE_TTL_TASK_MS_DEFAULT,
   STALE_TTL_REVIEW_MS_DEFAULT,
-  PROGRESS_TIMEOUT_MS_DEFAULT
+  PROGRESS_TIMEOUT_MS_DEFAULT,
+  withJobLock
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
@@ -369,6 +372,64 @@ test("upsertJob still blocks on a recent stealing side file without a lock", () 
   assert.equal(job.id, jobId);
   assert.equal(job.phase, "unblocked");
   assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).phase, "unblocked");
+});
+
+test("withJobLock nonblocking returns the callback result when uncontended", () => {
+  const workspace = makeTempDir();
+  const jobId = "nonblocking-uncontended";
+
+  const result = withJobLock(workspace, jobId, () => "lock-acquired", { nonblocking: true });
+
+  assert.equal(result, "lock-acquired");
+});
+
+test("withJobLock nonblocking throws JobLockUnavailableError immediately when lock is held", () => {
+  const workspace = makeTempDir();
+  const jobId = "nonblocking-held";
+  let elapsedMs = null;
+
+  withJobLock(workspace, jobId, () => {
+    const startedAt = Date.now();
+    assert.throws(
+      () => {
+        withJobLock(workspace, jobId, () => "should-not-run", { nonblocking: true });
+      },
+      (error) => {
+        assert.ok(error instanceof JobLockUnavailableError);
+        assert.equal(error.name, "JobLockUnavailableError");
+        assert.equal(error.jobId, jobId);
+        return true;
+      }
+    );
+    elapsedMs = Date.now() - startedAt;
+  });
+
+  assert.equal(elapsedMs < 100, true, `nonblocking lock acquisition took ${elapsedMs}ms`);
+});
+
+test("withJobLock nonblocking still reclaims a stale lock", () => {
+  const workspace = makeTempDir();
+  const jobId = "nonblocking-stale-takeover";
+  const jobFile = resolveJobFile(workspace, jobId);
+  const lockPath = path.join(path.dirname(jobFile), `${jobId}.lock`);
+  const staleTime = new Date(Date.now() - 61_000);
+
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      acquiredAt: staleTime.toISOString(),
+      token: "stale-token"
+    })}\n`,
+    "utf8"
+  );
+  fs.utimesSync(lockPath, staleTime, staleTime);
+
+  const result = withJobLock(workspace, jobId, () => "stale-lock-reclaimed", { nonblocking: true });
+
+  assert.equal(result, "stale-lock-reclaimed");
+  assert.equal(fs.existsSync(lockPath), false);
 });
 
 test("loadState migrates legacy state.json jobs[] into per-job files", () => {
@@ -2929,6 +2990,41 @@ test("applyStalenessUnderLock: clear case writes staleness: null", () => {
   assert.equal(record.staleness, null);
 });
 
+test("applyStalenessUnderLock: nonblocking throws JobLockUnavailableError when lock is held", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-nonblocking-held";
+  upsertJob(workspace, {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    startedAt: new Date(Date.now() - 10_000_000).toISOString(),
+    progressUpdatedAt: new Date(Date.now() - 400_000).toISOString(),
+    pid: null,
+    pidStartTime: null
+  });
+  const snapshot = { pid: null, pidStartTime: null, ttlTaskMs: 3_600_000, ttlReviewMs: 900_000, progressTimeoutMs: 300_000 };
+  let elapsedMs = null;
+
+  withJobLock(workspace, jobId, () => {
+    const startedAt = Date.now();
+    assert.throws(
+      () => {
+        applyStalenessUnderLock(workspace, jobId, snapshot, { nonblocking: true });
+      },
+      (error) => {
+        assert.ok(error instanceof JobLockUnavailableError);
+        assert.equal(error.jobId, jobId);
+        return true;
+      }
+    );
+    elapsedMs = Date.now() - startedAt;
+  });
+
+  assert.equal(elapsedMs < 100, true, `nonblocking staleness lock acquisition took ${elapsedMs}ms`);
+  const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(record.staleness, undefined);
+});
+
 // ---- reconcileStaleActiveJobs stale detection --------------------------------
 
 test("reconcileStaleActiveJobs: fresh job not flagged as stale", () => {
@@ -2963,6 +3059,95 @@ test("reconcileStaleActiveJobs: progress-stalled when progressUpdatedAt old", ()
   assert.ok(result.staleIds.includes(jobId));
   const record = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
   assert.deepEqual(record.staleness.reasons, ["progress-stalled"]);
+});
+
+test("reconcileStaleActiveJobs nonblocking skips a contended dead job and reaps a free dead job", async () => {
+  const workspace = makeTempDir();
+  const contendedJobId = "reconcile-nonblocking-dead-held";
+  const freeJobId = "reconcile-nonblocking-dead-free";
+  const contendedPid = await getExitedPid();
+  const freePid = await getExitedPid();
+  const timestamp = new Date().toISOString();
+
+  writeJobFileForTest(workspace, contendedJobId, {
+    id: contendedJobId,
+    status: "running",
+    phase: "working",
+    pid: contendedPid,
+    pidStartTime: "dead-contended",
+    progressUpdatedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+  writeJobFileForTest(workspace, freeJobId, {
+    id: freeJobId,
+    status: "running",
+    phase: "working",
+    pid: freePid,
+    pidStartTime: "dead-free",
+    progressUpdatedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  let result = null;
+  let elapsedMs = null;
+  withJobLock(workspace, contendedJobId, () => {
+    const startedAt = Date.now();
+    result = reconcileStaleActiveJobs(workspace, { nonblocking: true });
+    elapsedMs = Date.now() - startedAt;
+  });
+
+  assert.equal(elapsedMs < 1000, true, `nonblocking reconcile took ${elapsedMs}ms`);
+  assert.deepEqual(result.reconciledIds, [freeJobId]);
+  assert.deepEqual(result.staleIds, []);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].jobId, contendedJobId);
+  assert.equal(result.warnings[0].pid, contendedPid);
+  assert.equal(result.warnings[0].reason, RECONCILE_WARNING_REASON_RECONCILE_SKIPPED);
+  assert.match(result.warnings[0].message, /currently held/);
+  assert.equal(readStoredJob(workspace, contendedJobId).status, "running");
+  assert.equal(readStoredJob(workspace, freeJobId).status, "failed");
+});
+
+test("reconcileStaleActiveJobs nonblocking skips a contended stale-live job without tagging it", () => {
+  const pidStartTime = readPidStartTime(process.pid);
+  if (pidStartTime == null) {
+    return;
+  }
+
+  const workspace = makeTempDir();
+  const jobId = "reconcile-nonblocking-stale-held";
+  const timestamp = new Date().toISOString();
+  writeJobFileForTest(workspace, jobId, {
+    id: jobId,
+    status: "running",
+    phase: "working",
+    pid: process.pid,
+    pidStartTime,
+    startedAt: timestamp,
+    progressUpdatedAt: new Date(Date.now() - 400_000).toISOString(),
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  let result = null;
+  let elapsedMs = null;
+  withJobLock(workspace, jobId, () => {
+    const startedAt = Date.now();
+    result = reconcileStaleActiveJobs(workspace, { nonblocking: true });
+    elapsedMs = Date.now() - startedAt;
+  });
+
+  assert.equal(elapsedMs < 1000, true, `nonblocking stale reconcile took ${elapsedMs}ms`);
+  assert.deepEqual(result.reconciledIds, []);
+  assert.deepEqual(result.staleIds, []);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].jobId, jobId);
+  assert.equal(result.warnings[0].pid, process.pid);
+  assert.equal(result.warnings[0].reason, RECONCILE_WARNING_REASON_RECONCILE_SKIPPED);
+  assert.match(result.warnings[0].message, /currently held/);
+  assert.equal(readStoredJob(workspace, jobId).staleness, undefined);
 });
 
 test("reconcileStaleActiveJobs: skips obsolete stale tag when progress updates before lock", () => {

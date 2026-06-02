@@ -44,6 +44,7 @@ const STALE_TTL_MAX_MS = 86_400_000;
 const PROGRESS_TIMEOUT_MIN_MS = 30_000;
 const PROGRESS_TIMEOUT_MAX_MS = 3_600_000;
 export const STALE_REASONS_CANONICAL_ORDER = Object.freeze(["ttl-exceeded", "progress-stalled"]);
+export const RECONCILE_WARNING_REASON_RECONCILE_SKIPPED = "reconcile-skipped";
 
 // Module-level Set to dedupe env-var warnings per process lifetime
 const _envVarWarnedSet = new Set();
@@ -101,10 +102,23 @@ export function resolveCancelInterruptTimeoutMs(env = process.env) {
 }
 const SAFE_JOB_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
-class JobLockTimeoutError extends Error {
+class JobLockAcquisitionError extends Error {
+  constructor(name, message, jobId) {
+    super(message);
+    this.name = name;
+    this.jobId = jobId;
+  }
+}
+
+class JobLockTimeoutError extends JobLockAcquisitionError {
   constructor(jobId) {
-    super(`Timed out acquiring job lock for ${jobId}.`);
-    this.name = "JobLockTimeoutError";
+    super("JobLockTimeoutError", `Timed out acquiring job lock for ${jobId}.`, jobId);
+  }
+}
+
+export class JobLockUnavailableError extends JobLockAcquisitionError {
+  constructor(jobId) {
+    super("JobLockUnavailableError", `Job lock for ${jobId} is currently held.`, jobId);
   }
 }
 
@@ -735,9 +749,10 @@ function publishJobLock(lockPath, token) {
   }
 }
 
-function acquireJobLock(cwd, jobId) {
+function acquireJobLock(cwd, jobId, options = {}) {
   const lockPath = resolveJobLockFile(cwd, jobId);
   const token = createJobLockToken();
+  const nonblocking = Boolean(options.nonblocking);
   let attempts = 0;
 
   for (;;) {
@@ -751,12 +766,18 @@ function acquireJobLock(cwd, jobId) {
       }
     }
 
-    if (attempts >= JOB_LOCK_RETRY_COUNT) {
+    if (nonblocking || attempts >= JOB_LOCK_RETRY_COUNT) {
       const staleSnapshot = getStaleJobLockSnapshot(lockPath);
       if (staleSnapshot.stale && !hasRecentBlockingJobLockSideFile(lockPath)) {
-        stealStaleJobLock(lockPath, staleSnapshot, token);
+        const stolen = stealStaleJobLock(lockPath, staleSnapshot, token);
+        if (nonblocking && !stolen) {
+          throw new JobLockUnavailableError(jobId);
+        }
         attempts = 0;
         continue;
+      }
+      if (nonblocking) {
+        throw new JobLockUnavailableError(jobId);
       }
       throw new JobLockTimeoutError(jobId);
     }
@@ -766,9 +787,9 @@ function acquireJobLock(cwd, jobId) {
   }
 }
 
-export function withJobLock(cwd, jobId, fn) {
+export function withJobLock(cwd, jobId, fn, options = {}) {
   // Per-job lock serializes cross-process read/write and prune/delete critical sections.
-  const { lockPath, token } = acquireJobLock(cwd, jobId);
+  const { lockPath, token } = acquireJobLock(cwd, jobId, options);
   try {
     return fn(() => revalidateJobLock(lockPath, token, jobId));
   } finally {
@@ -1105,7 +1126,7 @@ function buildUnverifiableCancelSkipReason(jobId, identity) {
   );
 }
 
-export function applyStalenessUnderLock(workspaceRoot, jobId, classificationSnapshot) {
+export function applyStalenessUnderLock(workspaceRoot, jobId, classificationSnapshot, options = {}) {
   return withJobLock(workspaceRoot, jobId, (revalidateLock) => {
     const snapshot = classificationSnapshot ?? {};
     const jobFile = resolveJobFile(workspaceRoot, jobId);
@@ -1183,7 +1204,7 @@ export function applyStalenessUnderLock(workspaceRoot, jobId, classificationSnap
 
     writeJobFileUnlocked(workspaceRoot, jobId, patch, { beforeRename: revalidateLock });
     return { wrote: true, staleReasons: sortedReasons };
-  });
+  }, options);
 }
 
 export function commitCancelTombstoneUnderLock(workspaceRoot, jobId, options = {}) {
@@ -1269,7 +1290,8 @@ export function reconcileStaleActiveJobs(cwd, options = {}) {
   const {
     ttlTaskMs = resolveStaleTtlTaskMs(),
     ttlReviewMs = resolveStaleTtlReviewMs(),
-    progressTimeoutMs = resolveProgressTimeoutMs()
+    progressTimeoutMs = resolveProgressTimeoutMs(),
+    nonblocking = false
   } = options;
 
   const reconciledIds = [];
@@ -1290,53 +1312,69 @@ export function reconcileStaleActiveJobs(cwd, options = {}) {
         }
 
         if (classification.dead) {
-          withJobLock(cwd, job.id, (revalidateLock) => {
-            const jobFile = resolveJobFile(cwd, job.id);
-            let currentJob = null;
-            try {
-              currentJob = readJobFile(jobFile);
-            } catch (error) {
-              if (error?.code !== "ENOENT") {
-                throw error;
+          try {
+            withJobLock(cwd, job.id, (revalidateLock) => {
+              const jobFile = resolveJobFile(cwd, job.id);
+              let currentJob = null;
+              try {
+                currentJob = readJobFile(jobFile);
+              } catch (error) {
+                if (error?.code !== "ENOENT") {
+                  throw error;
+                }
+                return;
               }
-              return;
-            }
 
-            if (currentJob.updatedAt !== job.updatedAt || !isActiveJobStatus(currentJob.status)) {
-              return;
-            }
+              if (currentJob.updatedAt !== job.updatedAt || !isActiveJobStatus(currentJob.status)) {
+                return;
+              }
 
-            // Re-verify the identity that the out-of-lock classification was
-            // based on. If pid or pidStartTime changed between classification
-            // and lock acquisition, the record is no longer the one we
-            // classified dead — abort to avoid terminalizing a different
-            // process identity.
-            const sameIdentity =
-              (currentJob.pid ?? null) === (job.pid ?? null) &&
-              (currentJob.pidStartTime ?? null) === (job.pidStartTime ?? null);
-            if (!sameIdentity) {
-              return;
-            }
+              // Re-verify the identity that the out-of-lock classification was
+              // based on. If pid or pidStartTime changed between classification
+              // and lock acquisition, the record is no longer the one we
+              // classified dead — abort to avoid terminalizing a different
+              // process identity.
+              const sameIdentity =
+                (currentJob.pid ?? null) === (job.pid ?? null) &&
+                (currentJob.pidStartTime ?? null) === (job.pidStartTime ?? null);
+              if (!sameIdentity) {
+                return;
+              }
 
-            const timestamp = nowIso();
-            writeJobFileUnlocked(
-              cwd,
-              job.id,
-              {
-                ...currentJob,
-                status: "failed",
-                phase: "failed",
-                pid: null,
-                completedAt: timestamp,
-                updatedAt: timestamp,
-                errorMessage: "Process exited without writing a terminal state.",
-                staleness: null,
-                progressUpdatedAt: null
-              },
-              { beforeRename: revalidateLock }
-            );
-            reconciledIds.push(job.id);
-          });
+              const timestamp = nowIso();
+              writeJobFileUnlocked(
+                cwd,
+                job.id,
+                {
+                  ...currentJob,
+                  status: "failed",
+                  phase: "failed",
+                  pid: null,
+                  completedAt: timestamp,
+                  updatedAt: timestamp,
+                  errorMessage: "Process exited without writing a terminal state.",
+                  staleness: null,
+                  progressUpdatedAt: null
+                },
+                { beforeRename: revalidateLock }
+              );
+              reconciledIds.push(job.id);
+            }, { nonblocking });
+          } catch (error) {
+            if (error instanceof JobLockUnavailableError) {
+              const message = error.message;
+              warnings.push(
+                makeReconcileWarning(
+                  job?.id ?? null,
+                  classification.pid ?? normalizePid(job?.pid),
+                  RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+                  message
+                )
+              );
+              continue;
+            }
+            throw error;
+          }
           // Skip stale-but-alive detection for terminalized jobs
           continue;
         }
@@ -1352,9 +1390,20 @@ export function reconcileStaleActiveJobs(cwd, options = {}) {
 
         let stalenessResult = { wrote: false, staleReasons: [] };
         try {
-          stalenessResult = applyStalenessUnderLock(cwd, job.id, snapshot);
+          stalenessResult = applyStalenessUnderLock(cwd, job.id, snapshot, { nonblocking });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof JobLockUnavailableError) {
+            warnings.push(
+              makeReconcileWarning(
+                job?.id ?? null,
+                normalizePid(job?.pid),
+                RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+                message
+              )
+            );
+            continue;
+          }
           warnings.push(makeReconcileWarning(job?.id ?? null, normalizePid(job?.pid), "reconcile-error", message));
         }
 
