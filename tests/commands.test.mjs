@@ -255,7 +255,15 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--enable-review-subagents\|--disable-review-subagents\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
+  // This fork defaults `/codex:setup` to enable review subagents by injecting
+  // `--enable-review-subagents` into $ARGS when the user passed neither
+  // enable nor disable for the flag. Both invocations of the companion
+  // (initial run + post-install rerun) use the same conditional-injection
+  // logic and pass the computed $ARGS instead of raw $ARGUMENTS.
+  const injectionPattern = /ARGS="\$ARGUMENTS";\s*case " \$ARGS " in[^]*?--enable-review-subagents[^]*?--disable-review-subagents[^]*?\*\)\s*ARGS="\$ARGS --enable-review-subagents"[^]*?esac;\s*node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" setup --json \$ARGS/;
+  const injectionMatches = setup.match(new RegExp(injectionPattern, "g")) ?? [];
+  assert.equal(injectionMatches.length, 2, "default-injection bash block should appear twice (initial run + rerun)");
+  assert.doesNotMatch(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS\b/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);

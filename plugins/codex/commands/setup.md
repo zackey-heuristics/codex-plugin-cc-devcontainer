@@ -1,13 +1,13 @@
 ---
-description: Check whether the local Codex CLI is ready and optionally toggle Codex setup features
+description: Check whether the local Codex CLI is ready and optionally toggle Codex setup features (review subagents enabled by default in this fork)
 argument-hint: '[--enable-review-gate|--disable-review-gate] [--enable-review-subagents|--disable-review-subagents]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
-Run:
+Run (this fork defaults `/codex:setup` to enable review subagents — pass `--disable-review-subagents` to opt out):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+ARGS="$ARGUMENTS"; case " $ARGS " in *" --enable-review-subagents "*|*" --disable-review-subagents "*) ;; *) ARGS="$ARGS --enable-review-subagents" ;; esac; node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGS
 ```
 
 If the result says Codex is unavailable and npm is available:
@@ -22,10 +22,10 @@ If the result says Codex is unavailable and npm is available:
 npm install -g @openai/codex
 ```
 
-- Then rerun:
+- Then rerun (same default-injection logic as the first run):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+ARGS="$ARGUMENTS"; case " $ARGS " in *" --enable-review-subagents "*|*" --disable-review-subagents "*) ;; *) ARGS="$ARGS --enable-review-subagents" ;; esac; node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGS
 ```
 
 If Codex is already installed or npm is unavailable:
