@@ -189,12 +189,31 @@ guarantee event-loop quiescence even if the spawned `app-server`
 traps SIGTERM. The shared broker process is *never* killed by
 `forceDestroy`; only disposable spawned clients are.
 
-Unverifiable identities (no `pidStartTime`, `/proc` unreadable, etc.)
-are *skipped* by default in batch mode (`{ pid preserved, no signal }`),
-diverging from the single-cancel path which always attempts an
-interrupt. `--force` overrides the skip and signals the recorded PID
-without identity verification — matched against the single-cancel
-`--force` semantics from ADR 0005.
+Identity classifications are handled with the same defaults the
+single-cancel path uses in [ADR 0005](0005-pid-liveness-and-no-op-detection.md),
+so an operator who runs `/codex:cancel <id>` and `/codex:cancel --all-stale`
+on the same job gets the same outcome:
+
+- **`match`** — interrupt and SIGTERM the recorded PID.
+- **`platform-unverifiable`** (non-Linux platform; `/proc/<pid>/stat`
+  identity check is unavailable, so `pidStartTime` cannot be
+  cross-checked even though the recorded PID is still present) —
+  surface a per-job stderr warning and SIGTERM the recorded PID
+  without requiring `--force`. The trade-off (signal a possibly-reused
+  PID rather than refuse to cancel anything on macOS/Windows) is the
+  same one ADR 0005 made for the single-cancel path; the batch path
+  must not silently diverge from it, otherwise phase 1 would commit a
+  terminal tombstone while phase 2 left the worker alive — and because
+  the reconciler skips terminal records, no later stale sweep would
+  catch it.
+- **`unverifiable`** (Linux record without a `pidStartTime`, or
+  `/proc/<pid>/stat` unreadable due to permissions / different user) —
+  *skipped* by default in batch mode (`{ pid preserved, no signal }`);
+  `--force` overrides and signals the recorded PID. This is the
+  defensive default ADR 0005 chose for ambiguous Linux records.
+- **`mismatch`** / **`dead-no-process`** / **`no-pid`** — commit the
+  cancellation record without signalling; the original worker is
+  provably gone.
 
 Per-job errors are collected into a `errors[]` array; the rendered
 batch summary lists them, and `process.exitCode = 1` if any job

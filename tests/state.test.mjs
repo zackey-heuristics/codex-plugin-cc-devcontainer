@@ -2562,6 +2562,38 @@ test("commitCancelTombstoneUnderLock writes cancelled tombstone atomically for a
   assert.equal(record.progressUpdatedAt, null);
 });
 
+test("commitCancelTombstoneUnderLock commits platform-unverifiable stale active job and preserves signal pid", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-tombstone-platform-unverifiable";
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const originalPlatform = process.platform;
+  const originalPid = 99999;
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+  try {
+    upsertJob(workspace, {
+      id: jobId,
+      status: "running",
+      phase: "running",
+      startedAt: staleStartedAt,
+      progressUpdatedAt: staleStartedAt,
+      pid: originalPid,
+      pidStartTime: null
+    });
+
+    const result = commitCancelTombstoneUnderLock(workspace, jobId, { force: false });
+
+    assert.equal(result.outcome, "committed");
+    assert.equal(result.identity.kind, "platform-unverifiable");
+    assert.equal(result.signalRequired, true);
+    assert.equal(result.pid, originalPid);
+    const record = readStoredJob(workspace, jobId);
+    assert.equal(record.status, "cancelled");
+    assert.equal(record.pid, null);
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  }
+});
+
 test("commitCancelTombstoneUnderLock skips when job is no longer active", () => {
   const workspace = makeTempDir();
   const jobId = "task-tombstone-terminal-skip";

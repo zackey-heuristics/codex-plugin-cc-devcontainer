@@ -1320,7 +1320,13 @@ function runRecheckedCancelSignal(decision, options = {}) {
     return buildPidDriftCleanupError(decision, identity);
   }
 
-  if (identity.kind === "unverifiable" || identity.kind === "platform-unverifiable") {
+  if (identity.kind === "platform-unverifiable") {
+    writeCancelIdentityWarning(identity);
+    runCancelSignal(identity, options);
+    return null;
+  }
+
+  if (identity.kind === "unverifiable") {
     if (options.force) {
       writeCancelIdentityWarning(identity, { force: true });
       runCancelSignal(identity, { force: true });

@@ -438,6 +438,21 @@ process.kill = function (pid, signal) {
   return preloadPath;
 }
 
+function writePlatformOverridePreload(workspace, platform) {
+  const preloadPath = path.join(workspace, `platform-override-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+Object.defineProperty(process, "platform", {
+  value: ${JSON.stringify(platform)},
+  configurable: true
+});
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
 function writeCancelAllStaleIdentityDriftPreload(workspace, pid, signalMarker, deadOnCheck = 3) {
   const preloadPath = path.join(workspace, `cancel-all-stale-identity-drift-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
   fs.writeFileSync(
@@ -2408,6 +2423,71 @@ test("cancel --all-stale skips unverifiable stale jobs without force", async (t)
   assert.equal(record.status, "running");
   assert.equal(record.pid, sleeper.pid);
   assert.equal(record.pidStartTime, null);
+});
+
+test("cancel --all-stale signals platform-unverifiable stale jobs without force", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "platform-unverifiable-sigterm");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  seedRuntimeJob(workspace, {
+    id: "task-platform-unverifiable",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime: null
+  });
+
+  const preloadPath = writePlatformOverridePreload(workspace, "darwin");
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport({ ...process.env }, preloadPath)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-platform-unverifiable"]);
+  assert.deepEqual(payload.skipped, []);
+  assert.deepEqual(payload.errors, []);
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  assert.equal(fs.readFileSync(signalMarker, "utf8"), "SIGTERM\n");
+  const record = listJobs(workspace).find((job) => job.id === "task-platform-unverifiable");
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.pid, null);
 });
 
 test("cancel --all-stale --force signals and cancels unverifiable stale jobs", async (t) => {
