@@ -174,6 +174,16 @@ class AppServerClientBase {
     this.resolveExit(undefined);
   }
 
+  forceDestroy(reason = "codex app-server client force-destroyed.") {
+    if (this.forceDestroyed) {
+      return;
+    }
+
+    this.forceDestroyed = true;
+    this.closed = true;
+    this.handleExit(reason instanceof Error ? reason : new Error(String(reason)));
+  }
+
   sendMessage(_message) {
     throw new Error("sendMessage must be implemented by subclasses.");
   }
@@ -261,6 +271,51 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     await this.exitPromise;
   }
 
+  forceDestroy(reason = "codex app-server client force-destroyed.") {
+    if (this.forceDestroyed) {
+      return;
+    }
+
+    this.forceDestroyed = true;
+    this.closed = true;
+    if (this.readline) {
+      this.readline.close();
+    }
+    const proc = this.proc;
+    if (proc) {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGTERM");
+        }
+      } catch {
+        // The force path must still resolve the client even if the child
+        // exited between the killed check and signal delivery.
+      }
+      proc.stdio?.forEach((stream) => {
+        stream?.destroy();
+      });
+      try {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          // The interrupt timeout already gave this disposable child its cooperative window;
+          // hard-kill before unref so parent exit cannot drop the escalation.
+          if (process.platform === "win32") {
+            terminateProcessTree(proc.pid);
+          } else {
+            proc.kill("SIGKILL");
+          }
+        }
+      } catch {
+        // Force teardown is best effort; the parent must still be free to exit.
+      }
+      try {
+        proc.unref();
+      } catch {
+        // Best-effort teardown; handleExit below resolves pending callers.
+      }
+    }
+    this.handleExit(reason instanceof Error ? reason : new Error(String(reason)));
+  }
+
   sendMessage(message) {
     const line = `${JSON.stringify(message)}\n`;
     const stdin = this.proc?.stdin;
@@ -318,6 +373,23 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await this.exitPromise;
   }
 
+  forceDestroy(reason = "codex app-server client force-destroyed.") {
+    if (this.forceDestroyed) {
+      return;
+    }
+
+    this.forceDestroyed = true;
+    this.closed = true;
+    if (this.socket) {
+      try {
+        this.socket.destroy();
+      } catch {
+        // Destroy is best effort; handleExit below resolves pending callers.
+      }
+    }
+    this.handleExit(reason instanceof Error ? reason : new Error(String(reason)));
+  }
+
   sendMessage(message) {
     const line = `${JSON.stringify(message)}\n`;
     const socket = this.socket;
@@ -344,6 +416,9 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
+    if (typeof options.onClient === "function") {
+      options.onClient(client);
+    }
     await client.initialize();
     return client;
   }

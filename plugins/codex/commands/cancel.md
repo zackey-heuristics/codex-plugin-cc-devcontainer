@@ -1,6 +1,6 @@
 ---
-description: Cancel an active background Codex job in this repository
-argument-hint: '[job-id]'
+description: Cancel a Codex job by id, or sweep every stale job with --all-stale
+argument-hint: '[job-id|--all-stale] [--force] [--json]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

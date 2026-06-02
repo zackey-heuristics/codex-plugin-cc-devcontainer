@@ -9,6 +9,8 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
+    // Optional sync preflight bound; callers without it keep spawnSync's default.
+    timeout: options.timeoutMs,
     shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
     windowsHide: true
   });
@@ -39,6 +41,9 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   const result = runCommand(command, versionArgs, options);
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
+  }
+  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ETIMEDOUT" && options.timeoutMs) {
+    return { available: false, detail: `${command} preflight timed out after ${options.timeoutMs}ms` };
   }
   if (result.error) {
     return { available: false, detail: result.error.message };

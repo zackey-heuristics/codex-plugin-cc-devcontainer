@@ -3,12 +3,13 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { listJobs, readPidStartTime, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { runCommand } from "../plugins/codex/scripts/lib/process.mjs";
+import { listJobs, readPidStartTime, resolveJobFile, resolveStateDir, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -27,6 +28,599 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   }
   throw new Error("Timed out waiting for condition.");
 }
+
+async function waitForPidGone(pid, options = {}) {
+  await waitFor(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return true;
+      }
+      throw error;
+    }
+  }, options);
+}
+
+function runCompanionWithDeadline(args, { cwd, env = process.env, timeoutMs = 1000 } = {}) {
+  const startedAt = Date.now();
+  const child = spawn(process.execPath, [SCRIPT, ...args], {
+    cwd,
+    env
+  });
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  return new Promise((resolve) => {
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, 200).unref?.();
+    }, timeoutMs);
+
+    child.on("exit", (status, signal) => {
+      clearTimeout(killTimer);
+      resolve({
+        status,
+        signal,
+        stdout,
+        stderr,
+        timedOut,
+        durationMs: Date.now() - startedAt
+      });
+    });
+  });
+}
+
+function seedRuntimeJob(workspace, patch) {
+  return upsertJob(workspace, {
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    startedAt: new Date().toISOString(),
+    progressUpdatedAt: new Date().toISOString(),
+    pid: null,
+    pidStartTime: null,
+    ...patch
+  });
+}
+
+function installNeverRespondingCodex(binDir) {
+  const scriptPath = path.join(binDir, "codex");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex fake");
+  process.exit(0);
+}
+if (args[0] === "app-server" && args[1] === "--help") {
+  console.log("fake app-server help");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  process.exit(0);
+}
+
+if (process.env.CODEX_TEST_APP_SERVER_PID_FILE) {
+  fs.writeFileSync(process.env.CODEX_TEST_APP_SERVER_PID_FILE, String(process.pid), "utf8");
+}
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+process.stdin.resume();
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "initialized") {
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    return;
+  }
+  if (message.id !== undefined) {
+    send({ id: message.id, result: {} });
+  }
+});
+`,
+    "utf8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+}
+
+function installInterruptThenCloseHangingCodex(binDir) {
+  const scriptPath = path.join(binDir, "codex");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex fake");
+  process.exit(0);
+}
+if (args[0] === "app-server" && args[1] === "--help") {
+  console.log("fake app-server help");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  process.exit(0);
+}
+
+if (process.env.CODEX_TEST_APP_SERVER_PID_FILE) {
+  fs.writeFileSync(process.env.CODEX_TEST_APP_SERVER_PID_FILE, String(process.pid), "utf8");
+}
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+process.stdin.resume();
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "initialized") {
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.id !== undefined) {
+    send({ id: message.id, result: {} });
+  }
+});
+`,
+    "utf8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+}
+
+function installPreflightHangingCodex(binDir) {
+  const scriptPath = path.join(binDir, "codex");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+process.on("SIGTERM", () => {});
+if (args[0] === "--version" || (args[0] === "app-server" && args[1] === "--help")) {
+  if (process.env.CODEX_TEST_PREFLIGHT_MARKER) {
+    fs.writeFileSync(process.env.CODEX_TEST_PREFLIGHT_MARKER, args.join(" "), "utf8");
+  }
+  process.stdin.resume();
+  setInterval(() => {}, 1000);
+  return;
+}
+if (args[0] === "app-server") {
+  console.error("fake app-server reached after preflight bypass");
+  process.exit(42);
+}
+process.exit(0);
+`,
+    "utf8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+}
+
+function installSuccessfulInterruptCodex(binDir, sigtermMarker) {
+  const scriptPath = path.join(binDir, "codex");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const marker = ${JSON.stringify(sigtermMarker)};
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex fake");
+  process.exit(0);
+}
+if (args[0] === "app-server" && args[1] === "--help") {
+  console.log("fake app-server help");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  process.exit(0);
+}
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "initialized") {
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.id !== undefined) {
+    send({ id: message.id, result: {} });
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+`,
+    "utf8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+}
+
+function writeCancelAllStaleMutationPreload(workspace) {
+  const preloadPath = path.join(workspace, `cancel-all-stale-preload-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const target = process.env.CODEX_TEST_MUTATE_JOB_FILE
+  ? path.resolve(process.env.CODEX_TEST_MUTATE_JOB_FILE)
+  : null;
+const mode = process.env.CODEX_TEST_MUTATE_JOB_MODE;
+const readyFile = process.env.CODEX_TEST_MUTATE_READY_FILE
+  ? path.resolve(process.env.CODEX_TEST_MUTATE_READY_FILE)
+  : null;
+const continueFile = process.env.CODEX_TEST_MUTATE_CONTINUE_FILE
+  ? path.resolve(process.env.CODEX_TEST_MUTATE_CONTINUE_FILE)
+  : null;
+const skipStaleReads = Number(process.env.CODEX_TEST_MUTATE_SKIP_STALE_READS || "0");
+let mutated = false;
+let staleReadCount = 0;
+
+const originalReadFileSync = fs.readFileSync.bind(fs);
+const originalWriteFileSync = fs.writeFileSync.bind(fs);
+const originalUnlinkSync = fs.unlinkSync.bind(fs);
+const originalMkdirSync = fs.mkdirSync.bind(fs);
+
+function normalizeFile(file) {
+  if (typeof file === "string") {
+    return file;
+  }
+  if (file instanceof URL) {
+    return fileURLToPath(file);
+  }
+  return null;
+}
+
+function waitForContinueFile() {
+  if (readyFile) {
+    originalWriteFileSync(readyFile, "ready\\n", "utf8");
+  }
+  if (!continueFile) {
+    return;
+  }
+  const sleepView = new Int32Array(new SharedArrayBuffer(4));
+  while (!fs.existsSync(continueFile)) {
+    Atomics.wait(sleepView, 0, 0, 10);
+  }
+}
+
+fs.readFileSync = function (file, ...args) {
+  const result = originalReadFileSync(file, ...args);
+  const filePath = normalizeFile(file);
+  if (!mutated && target && filePath && path.resolve(filePath) === target) {
+    try {
+      const record = JSON.parse(String(result));
+      const staleReasons = record?.staleness?.reasons;
+      if ((record?.status === "queued" || record?.status === "running") && Array.isArray(staleReasons) && staleReasons.length > 0) {
+        staleReadCount += 1;
+        if (staleReadCount <= skipStaleReads) {
+          return result;
+        }
+        mutated = true;
+        if (mode === "terminalize") {
+          const timestamp = new Date().toISOString();
+          originalWriteFileSync(
+            target,
+            JSON.stringify(
+              {
+                ...record,
+                status: "completed",
+                phase: "done",
+                completedAt: timestamp,
+                updatedAt: timestamp,
+                staleness: null
+              },
+              null,
+              2
+            ) + "\\n",
+            "utf8"
+          );
+        } else if (mode === "refresh-progress") {
+          const timestamp = new Date().toISOString();
+          originalWriteFileSync(
+            target,
+            JSON.stringify(
+              {
+                ...record,
+                progressUpdatedAt: timestamp,
+                updatedAt: timestamp,
+                staleness: null
+              },
+              null,
+              2
+            ) + "\\n",
+            "utf8"
+          );
+        } else if (mode === "replace-with-directory") {
+          originalUnlinkSync(target);
+          originalMkdirSync(target);
+        } else if (mode === "pause-on-stale-read") {
+          waitForContinueFile();
+        }
+      }
+    } catch {
+      // Leave unrelated reads alone.
+    }
+  }
+  return result;
+};
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function writeCancelAllStaleSignalFailurePreload(workspace, pid) {
+  const preloadPath = path.join(workspace, `cancel-all-stale-signal-failure-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+const targetPid = ${JSON.stringify(pid)};
+const originalKill = process.kill.bind(process);
+
+process.kill = function (pid, signal) {
+  const numericPid = Number(pid);
+  if (signal === "SIGTERM" && Math.abs(numericPid) === targetPid) {
+    const error = new Error("forced SIGTERM failure for test");
+    error.code = "EPERM";
+    throw error;
+  }
+  return originalKill(pid, signal);
+};
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function writePlatformOverridePreload(workspace, platform) {
+  const preloadPath = path.join(workspace, `platform-override-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+Object.defineProperty(process, "platform", {
+  value: ${JSON.stringify(platform)},
+  configurable: true
+});
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function writeCancelAllStaleIdentityDriftPreload(workspace, pid, signalMarker, deadOnCheck = 3) {
+  const preloadPath = path.join(workspace, `cancel-all-stale-identity-drift-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+import fs from "node:fs";
+
+const targetPid = ${JSON.stringify(pid)};
+const marker = ${JSON.stringify(signalMarker)};
+const deadOnCheck = ${JSON.stringify(deadOnCheck)};
+const originalKill = process.kill.bind(process);
+let identityChecks = 0;
+
+process.kill = function (pid, signal) {
+  const numericPid = Number(pid);
+  if (Math.abs(numericPid) === targetPid && signal === 0) {
+    identityChecks += 1;
+    if (identityChecks >= deadOnCheck) {
+      const error = new Error("simulated process exit before signal");
+      error.code = "ESRCH";
+      throw error;
+    }
+    return true;
+  }
+  if (Math.abs(numericPid) === targetPid && signal === "SIGTERM") {
+    fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  }
+  return originalKill(pid, signal);
+};
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function writeCancelAllStaleUnreadableStartTimePreload(workspace, pid) {
+  const preloadPath = path.join(workspace, `cancel-all-stale-unreadable-start-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+import fs from "node:fs";
+
+const target = ${JSON.stringify(`/proc/${pid}/stat`)};
+const originalReadFileSync = fs.readFileSync.bind(fs);
+let statReads = 0;
+
+fs.readFileSync = function (file, ...args) {
+  if (String(file) === target) {
+    statReads += 1;
+    if (statReads >= 3) {
+      const error = new Error("simulated unreadable pid start time");
+      error.code = "ENOENT";
+      throw error;
+    }
+  }
+  return originalReadFileSync(file, ...args);
+};
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function writeCancelAllStaleMismatchedStartTimePreload(workspace, pid, mismatchOnRead = 2) {
+  const preloadPath = path.join(workspace, `cancel-all-stale-mismatch-start-${Date.now()}-${Math.random().toString(36).slice(2)}.mjs`);
+  fs.writeFileSync(
+    preloadPath,
+    `
+import fs from "node:fs";
+
+const target = ${JSON.stringify(`/proc/${pid}/stat`)};
+const mismatchOnRead = ${JSON.stringify(mismatchOnRead)};
+const originalReadFileSync = fs.readFileSync.bind(fs);
+let statReads = 0;
+
+function withDifferentStartTime(stat) {
+  const text = String(stat);
+  const commEnd = text.lastIndexOf(")");
+  if (commEnd === -1) {
+    return stat;
+  }
+  const fields = text.slice(commEnd + 1).split(/\\s+/);
+  fields[20] = String(Number(fields[20] || "0") + 1);
+  return text.slice(0, commEnd + 1) + fields.join(" ");
+}
+
+fs.readFileSync = function (file, ...args) {
+  const result = originalReadFileSync(file, ...args);
+  if (String(file) === target) {
+    statReads += 1;
+    if (statReads >= mismatchOnRead) {
+      return withDifferentStartTime(result);
+    }
+  }
+  return result;
+};
+`,
+    "utf8"
+  );
+  return preloadPath;
+}
+
+function envWithNodeImport(env, preloadPath) {
+  const importOption = `--import=${pathToFileURL(preloadPath).href}`;
+  return {
+    ...env,
+    NODE_OPTIONS: [env.NODE_OPTIONS, importOption].filter(Boolean).join(" ")
+  };
+}
+
+function installSlowInterruptCodex(binDir) {
+  const scriptPath = path.join(binDir, "codex");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex fake");
+  process.exit(0);
+}
+if (args[0] === "app-server" && args[1] === "--help") {
+  console.log("fake app-server help");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  process.exit(0);
+}
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "initialized") {
+    return;
+  }
+  if (message.method === "turn/interrupt") {
+    const delayMs = Number(process.env.CODEX_TEST_INTERRUPT_DELAY_MS || "150");
+    setTimeout(() => send({ id: message.id, result: {} }), delayMs);
+    return;
+  }
+  if (message.id !== undefined) {
+    send({ id: message.id, result: {} });
+  }
+});
+process.stdin.on("end", () => setTimeout(() => process.exit(0), 10));
+`,
+    "utf8"
+  );
+  fs.chmodSync(scriptPath, 0o755);
+}
+
+test("runCommand timeoutMs option times out and reports failure", () => {
+  const result = runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    timeoutMs: 50
+  });
+
+  assert.equal(result.error?.code, "ETIMEDOUT");
+  assert.equal(result.signal, "SIGTERM");
+});
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
@@ -1642,6 +2236,1077 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
   assert.equal(listJobs(workspace)[0].status, "cancelled");
+});
+
+test("cancel --all-stale cancels multiple stale active jobs and leaves fresh active jobs alone", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-stale-a",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-stale-b",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-fresh",
+    startedAt: new Date().toISOString(),
+    progressUpdatedAt: new Date().toISOString()
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Cancelled 2 stale jobs\./);
+  assert.match(result.stdout, /task-stale-a -> cancelled/);
+  assert.match(result.stdout, /task-stale-b -> cancelled/);
+  assert.doesNotMatch(result.stdout, /task-fresh -> cancelled/);
+
+  const jobs = new Map(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs.get("task-stale-a").status, "cancelled");
+  assert.equal(jobs.get("task-stale-b").status, "cancelled");
+  assert.equal(jobs.get("task-fresh").status, "running");
+});
+
+test("cancel --all-stale includes stale jobs from other Claude sessions", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-other-session",
+    sessionId: "sess-other",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.mode, "all-stale");
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-other-session"]);
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-other-session").status, "cancelled");
+});
+
+test("cancel --all-stale with no stale jobs exits successfully with a friendly message", () => {
+  const workspace = makeTempDir();
+  seedRuntimeJob(workspace, {
+    id: "task-fresh"
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "No stale jobs to cancel.\n");
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-fresh").status, "running");
+});
+
+test("cancel --all-stale rejects an explicit job id", () => {
+  const workspace = makeTempDir();
+
+  const result = run("node", [SCRIPT, "cancel", "task-live", "--all-stale"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Pass either a job id or --all-stale, not both\./);
+});
+
+test("cancel --all-stale --json reports counts and result arrays", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-json-a",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-json-b",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.mode, "all-stale");
+  assert.deepEqual(payload.counts, { cancelled: 2, skipped: 0, errors: 0 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId).sort(), ["task-json-a", "task-json-b"]);
+  assert.deepEqual(payload.skipped, []);
+  assert.deepEqual(payload.errors, []);
+});
+
+test("cancel --all-stale is idempotent after stale jobs are cancelled", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-idempotent",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const first = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(JSON.parse(first.stdout).counts.cancelled, 1);
+
+  const second = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+  assert.equal(second.status, 0, second.stderr);
+  const payload = JSON.parse(second.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 0, skipped: 0, errors: 0 });
+  assert.deepEqual(payload.errors, []);
+});
+
+test("cancel --all-stale skips unverifiable stale jobs without force", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  seedRuntimeJob(workspace, {
+    id: "task-unverifiable",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime: null
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 0, skipped: 1, errors: 0 });
+  assert.equal(payload.cancelled.length, 0);
+  assert.equal(payload.skipped[0].jobId, "task-unverifiable");
+  assert.match(payload.skipped[0].reason, /PID identity unverifiable/);
+  assert.match(payload.skipped[0].reason, /\/codex:cancel --all-stale --force/);
+  assert.match(payload.skipped[0].reason, /\/codex:cancel --force task-unverifiable/);
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+  const record = listJobs(workspace).find((job) => job.id === "task-unverifiable");
+  assert.equal(record.status, "running");
+  assert.equal(record.pid, sleeper.pid);
+  assert.equal(record.pidStartTime, null);
+});
+
+test("cancel --all-stale signals platform-unverifiable stale jobs without force", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "platform-unverifiable-sigterm");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  seedRuntimeJob(workspace, {
+    id: "task-platform-unverifiable",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime: null
+  });
+
+  const preloadPath = writePlatformOverridePreload(workspace, "darwin");
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport({ ...process.env }, preloadPath)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-platform-unverifiable"]);
+  assert.deepEqual(payload.skipped, []);
+  assert.deepEqual(payload.errors, []);
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  assert.equal(fs.readFileSync(signalMarker, "utf8"), "SIGTERM\n");
+  const record = listJobs(workspace).find((job) => job.id === "task-platform-unverifiable");
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.pid, null);
+});
+
+test("cancel --all-stale --force signals and cancels unverifiable stale jobs", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "sleeper-sigterm");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  seedRuntimeJob(workspace, {
+    id: "task-unverifiable-force",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime: null
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--force", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-unverifiable-force"]);
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  const record = listJobs(workspace).find((job) => job.id === "task-unverifiable-force");
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.pid, null);
+});
+
+test("cancel --all-stale skips job that refreshes progress after reconcile but before tombstone, and sends no signal", async (t) => {
+  const workspace = makeTempDir();
+  const startedAt = new Date().toISOString();
+  const staleProgressAt = new Date(Date.now() - 400_000).toISOString();
+  const signalMarker = path.join(workspace, "refreshed-job-sigterm");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-refreshed-race",
+    startedAt,
+    progressUpdatedAt: staleProgressAt,
+    pid: sleeper.pid,
+    pidStartTime
+  });
+
+  const preloadPath = writeCancelAllStaleMutationPreload(workspace);
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport(
+      {
+        ...process.env,
+        CODEX_TEST_MUTATE_JOB_FILE: resolveJobFile(workspace, "task-refreshed-race"),
+        CODEX_TEST_MUTATE_JOB_MODE: "refresh-progress"
+      },
+      preloadPath
+    )
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 0, skipped: 1, errors: 0 });
+  assert.equal(payload.skipped[0].jobId, "task-refreshed-race");
+  assert.match(payload.skipped[0].reason, /no longer stale/);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(fs.existsSync(signalMarker), false);
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+  const record = listJobs(workspace).find((job) => job.id === "task-refreshed-race");
+  assert.equal(record.status, "running");
+  assert.equal(record.pid, sleeper.pid);
+  assert.equal(record.staleness, null);
+});
+
+test("cancel --all-stale skips job that terminalizes between reconcile and tombstone, and sends no signal", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "terminalized-job-sigterm");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-terminalized-race",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime
+  });
+
+  const preloadPath = writeCancelAllStaleMutationPreload(workspace);
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport(
+      {
+        ...process.env,
+        CODEX_TEST_MUTATE_JOB_FILE: resolveJobFile(workspace, "task-terminalized-race"),
+        CODEX_TEST_MUTATE_JOB_MODE: "terminalize"
+      },
+      preloadPath
+    )
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 0, skipped: 1, errors: 0 });
+  assert.equal(payload.skipped[0].jobId, "task-terminalized-race");
+  assert.match(payload.skipped[0].reason, /already completed/);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(fs.existsSync(signalMarker), false);
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-terminalized-race").status, "completed");
+});
+
+test("cancel --all-stale writes cancelled tombstone BEFORE sending SIGTERM", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "tombstone-before-sigterm");
+  const jobFile = resolveJobFile(workspace, "task-tombstone-before-signal");
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+const jobFile = ${JSON.stringify(jobFile)};
+process.on("SIGTERM", () => {
+  const record = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  fs.writeFileSync(marker, record.status + "\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-tombstone-before-signal",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  assert.equal(fs.readFileSync(signalMarker, "utf8").trim(), "cancelled");
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-tombstone-before-signal").status, "cancelled");
+});
+
+test("cancel --all-stale tombstone survives a late worker completed update", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-late-completed-after-cancel",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-late-completed-after-cancel"]);
+  const cancelledAt = listJobs(workspace).find((job) => job.id === "task-late-completed-after-cancel").cancelledAt;
+  upsertJob(workspace, {
+    id: "task-late-completed-after-cancel",
+    status: "completed",
+    phase: "done",
+    completedAt: new Date().toISOString(),
+    result: { summary: "worker finished after cancel" },
+    rendered: "worker finished after cancel",
+    pid: 123456,
+    pidStartTime: "late-worker"
+  });
+  const record = listJobs(workspace).find((job) => job.id === "task-late-completed-after-cancel");
+  assert.equal(record.status, "cancelled");
+  assert.equal(record.phase, "cancelled");
+  assert.equal(record.cancelledAt, cancelledAt);
+  assert.equal(record.pid, null);
+});
+
+test("cancel --all-stale concurrent runs cancel a job once; the second run sees the terminal state and skips", async () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-concurrent-once",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const firstPreload = writeCancelAllStaleMutationPreload(workspace);
+  const secondPreload = writeCancelAllStaleMutationPreload(workspace);
+  const firstReady = path.join(workspace, "first-ready");
+  const firstContinue = path.join(workspace, "first-continue");
+  const secondReady = path.join(workspace, "second-ready");
+  const secondContinue = path.join(workspace, "second-continue");
+
+  function spawnCancel(preloadPath, readyFile, continueFile, extraEnv = {}) {
+    const child = spawn(process.execPath, [SCRIPT, "cancel", "--all-stale", "--json"], {
+      cwd: workspace,
+      env: envWithNodeImport(
+        {
+          ...process.env,
+          CODEX_TEST_MUTATE_JOB_FILE: resolveJobFile(workspace, "task-concurrent-once"),
+          CODEX_TEST_MUTATE_JOB_MODE: "pause-on-stale-read",
+          CODEX_TEST_MUTATE_READY_FILE: readyFile,
+          CODEX_TEST_MUTATE_CONTINUE_FILE: continueFile,
+          ...extraEnv
+        },
+        preloadPath
+      )
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    return {
+      child,
+      done: new Promise((resolve) => {
+        child.on("exit", (status, signal) => resolve({ status, signal, stdout, stderr }));
+      })
+    };
+  }
+
+  const first = spawnCancel(firstPreload, firstReady, firstContinue);
+  await waitFor(() => fs.existsSync(firstReady), { timeoutMs: 3000, intervalMs: 25 });
+  const second = spawnCancel(secondPreload, secondReady, secondContinue, {
+    CODEX_TEST_MUTATE_SKIP_STALE_READS: "2"
+  });
+  await waitFor(() => fs.existsSync(secondReady), { timeoutMs: 3000, intervalMs: 25 });
+  fs.writeFileSync(firstContinue, "go\n", "utf8");
+  const firstResult = await first.done;
+  fs.writeFileSync(secondContinue, "go\n", "utf8");
+  const secondResult = await second.done;
+
+  assert.equal(firstResult.status, 0, firstResult.stderr);
+  assert.equal(secondResult.status, 0, secondResult.stderr);
+  const firstPayload = JSON.parse(firstResult.stdout);
+  const secondPayload = JSON.parse(secondResult.stdout);
+  assert.equal(firstPayload.counts.cancelled, 1);
+  assert.deepEqual(secondPayload.counts, { cancelled: 0, skipped: 1, errors: 0 });
+  assert.equal(secondPayload.skipped[0].jobId, "task-concurrent-once");
+  assert.match(secondPayload.skipped[0].reason, /already cancelled/);
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-concurrent-once").status, "cancelled");
+});
+
+test("cancel --all-stale reports reconcile errors and exits non-zero", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "jobs"), "not a directory\n", "utf8");
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.mode, "all-stale");
+  assert.deepEqual(payload.counts, { cancelled: 0, skipped: 0, errors: 1 });
+  assert.equal(payload.errors[0].jobId, null);
+  assert.match(payload.errors[0].message, /ENOTDIR|not a directory/i);
+});
+
+test("cancel --all-stale phase-two signal failure is reported in errors and batch continues to next job and exits non-zero", async (t) => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-after-signal-failure",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-signal-failure",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime
+  });
+
+  const preloadPath = writeCancelAllStaleSignalFailurePreload(workspace, sleeper.pid);
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport({ ...process.env }, preloadPath)
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 2, skipped: 0, errors: 1 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId).sort(), [
+    "task-after-signal-failure",
+    "task-signal-failure"
+  ]);
+  assert.equal(payload.errors[0].jobId, "task-signal-failure");
+  assert.match(payload.errors[0].message, /forced SIGTERM failure/);
+  const jobs = new Map(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs.get("task-signal-failure").status, "cancelled");
+  assert.equal(jobs.get("task-after-signal-failure").status, "cancelled");
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+});
+
+test("cancel --all-stale exits within bounded wall-clock time when app-server ignores SIGTERM", async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const appServerPidFile = path.join(workspace, "app-server.pid");
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  installNeverRespondingCodex(binDir);
+
+  t.after(() => {
+    if (!fs.existsSync(appServerPidFile)) {
+      return;
+    }
+    const pid = Number(fs.readFileSync(appServerPidFile, "utf8"));
+    if (Number.isFinite(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  seedRuntimeJob(workspace, {
+    id: "task-app-server-ignores-sigterm",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    threadId: "thread-ignores-sigterm",
+    turnId: "turn-ignores-sigterm"
+  });
+
+  const result = await runCompanionWithDeadline(["cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS: "50",
+      CODEX_TEST_APP_SERVER_PID_FILE: appServerPidFile
+    },
+    timeoutMs: 5000
+  });
+
+  assert.equal(result.timedOut, false, result.stderr);
+  assert.ok(result.durationMs < 3000, `expected bounded exit, got ${result.durationMs}ms`);
+  assert.equal(result.status, 1, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 1 });
+  assert.equal(payload.errors[0].jobId, "task-app-server-ignores-sigterm");
+  assert.match(payload.errors[0].message, /interrupt timed out after 50ms; sent SIGTERM \(no PID recorded\)/);
+  assert.doesNotMatch(payload.errors[0].message, /PID null/);
+  const appServerPid = Number(fs.readFileSync(appServerPidFile, "utf8"));
+  await waitForPidGone(appServerPid, { timeoutMs: 1500, intervalMs: 25 });
+});
+
+test("cancel --all-stale completes promptly when interrupt succeeds but app-server ignores EOF and SIGTERM on close", async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const appServerPidFile = path.join(workspace, "app-server-success-close-hang.pid");
+  const signalMarker = path.join(workspace, "success-close-sigterm");
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  installInterruptThenCloseHangingCodex(binDir);
+
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+    if (!fs.existsSync(appServerPidFile)) {
+      return;
+    }
+    const pid = Number(fs.readFileSync(appServerPidFile, "utf8"));
+    if (Number.isFinite(pid)) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-successful-interrupt-close-hangs",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime,
+    threadId: "thread-success-close-hang",
+    turnId: "turn-success-close-hang"
+  });
+
+  const result = await runCompanionWithDeadline(["cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_TEST_APP_SERVER_PID_FILE: appServerPidFile
+    },
+    timeoutMs: 5000
+  });
+
+  assert.equal(result.timedOut, false, result.stderr);
+  assert.ok(result.durationMs < 1000, `expected bounded close cleanup, got ${result.durationMs}ms`);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
+  assert.equal(payload.cancelled[0].jobId, "task-successful-interrupt-close-hangs");
+  assert.equal(payload.cancelled[0].turnInterrupted, true);
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  const appServerPid = Number(fs.readFileSync(appServerPidFile, "utf8"));
+  await waitForPidGone(appServerPid, { timeoutMs: 1500, intervalMs: 25 });
+});
+
+test("cancel --all-stale exits promptly when codex preflight ignores SIGTERM", async () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const preflightMarker = path.join(workspace, "preflight-invoked");
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  installPreflightHangingCodex(binDir);
+  seedRuntimeJob(workspace, {
+    id: "task-preflight-ignores-sigterm",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    threadId: "thread-preflight",
+    turnId: "turn-preflight"
+  });
+
+  const result = await runCompanionWithDeadline(["cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS: "500",
+      CODEX_TEST_PREFLIGHT_MARKER: preflightMarker
+    },
+    timeoutMs: 5000
+  });
+
+  assert.equal(result.timedOut, false, result.stderr);
+  assert.ok(result.durationMs < 3000, `expected bounded exit, got ${result.durationMs}ms`);
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(fs.existsSync(preflightMarker), false, "batch interrupt should not run codex preflight");
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 1 });
+  assert.equal(payload.errors[0].jobId, "task-preflight-ignores-sigterm");
+  assert.match(payload.errors[0].message, /codex app-server (exited unexpectedly|connection closed)/);
+});
+
+test("cancel --all-stale phase-two interrupt timeout is reported in errors, PID signal still attempted, batch continues, exit non-zero", async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  const signalMarker = path.join(workspace, "timeout-sigterm");
+  installSlowInterruptCodex(binDir);
+  const sleeper = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+const fs = require("node:fs");
+const marker = ${JSON.stringify(signalMarker)};
+process.on("SIGTERM", () => {
+  fs.writeFileSync(marker, "SIGTERM\\n", "utf8");
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+`
+    ],
+    {
+      cwd: workspace,
+      detached: true,
+      stdio: "ignore"
+    }
+  );
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-after-interrupt-timeout",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-interrupt-timeout",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime,
+    threadId: "thread-timeout",
+    turnId: "turn-timeout"
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS: "25",
+      CODEX_TEST_INTERRUPT_DELAY_MS: "150"
+    }
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 2, skipped: 0, errors: 1 });
+  assert.equal(payload.errors[0].jobId, "task-interrupt-timeout");
+  assert.match(payload.errors[0].message, new RegExp(`interrupt timed out after 25ms; sent SIGTERM to PID ${sleeper.pid}`));
+  await waitFor(() => fs.existsSync(signalMarker), { timeoutMs: 3000, intervalMs: 25 });
+  const jobs = new Map(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs.get("task-interrupt-timeout").status, "cancelled");
+  assert.equal(jobs.get("task-after-interrupt-timeout").status, "cancelled");
+});
+
+test("cancel --all-stale phase-two interrupt timeout honors CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS override", async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  installSlowInterruptCodex(binDir);
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: workspace,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const pidStartTime = await waitFor(() => readPidStartTime(sleeper.pid), {
+    timeoutMs: 3000,
+    intervalMs: 25
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-interrupt-timeout-override",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt,
+    pid: sleeper.pid,
+    pidStartTime,
+    threadId: "thread-timeout-override",
+    turnId: "turn-timeout-override"
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS: "75",
+      CODEX_TEST_INTERRUPT_DELAY_MS: "200"
+    }
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 1 });
+  assert.equal(payload.errors[0].jobId, "task-interrupt-timeout-override");
+  assert.match(payload.errors[0].message, new RegExp(`interrupt timed out after 75ms; sent SIGTERM to PID ${sleeper.pid}`));
+});
+
+test("cancel --all-stale exits non-zero on per-job failure while completing the rest", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-error",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+  seedRuntimeJob(workspace, {
+    id: "task-ok",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const preloadPath = writeCancelAllStaleMutationPreload(workspace);
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace,
+    env: envWithNodeImport(
+      {
+        ...process.env,
+        CODEX_TEST_MUTATE_JOB_FILE: resolveJobFile(workspace, "task-error"),
+        CODEX_TEST_MUTATE_JOB_MODE: "replace-with-directory"
+      },
+      preloadPath
+    )
+  });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 1 });
+  assert.deepEqual(payload.cancelled.map((job) => job.jobId), ["task-ok"]);
+  assert.equal(payload.errors[0].jobId, "task-error");
+  assert.match(payload.errors[0].message, /EISDIR|directory/i);
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-ok").status, "cancelled");
+});
+
+test("cancel --all-stale exits zero for a clean batch", () => {
+  const workspace = makeTempDir();
+  const staleStartedAt = new Date(Date.now() - 4_000_000).toISOString();
+  seedRuntimeJob(workspace, {
+    id: "task-clean-exit",
+    startedAt: staleStartedAt,
+    progressUpdatedAt: staleStartedAt
+  });
+
+  const result = run("node", [SCRIPT, "cancel", "--all-stale", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.counts, { cancelled: 1, skipped: 0, errors: 0 });
 });
 
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {

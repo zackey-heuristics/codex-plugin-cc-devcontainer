@@ -117,6 +117,59 @@ function formatJobInvoker(job) {
   return typeof job.invoker === "string" && job.invoker ? job.invoker : "unknown";
 }
 
+const STALE_REASON_LABELS = {
+  "ttl-exceeded": "TTL exceeded",
+  "progress-stalled": "progress stalled"
+};
+
+function formatStaleAge(ageMs) {
+  if (ageMs == null || !Number.isFinite(ageMs) || ageMs < 0) {
+    return null;
+  }
+  return formatNoOpDuration(ageMs);
+}
+
+function formatStalenessReason(reason, staleness, nowMs = Date.now()) {
+  if (typeof reason !== "string" || !Object.prototype.hasOwnProperty.call(STALE_REASON_LABELS, reason)) {
+    return null;
+  }
+  const label = STALE_REASON_LABELS[reason];
+  let ageMs = null;
+  if (reason === "ttl-exceeded") {
+    ageMs = staleness?.ageMs;
+  } else if (reason === "progress-stalled" && Number.isFinite(staleness?.lastProgressMs)) {
+    ageMs = nowMs - staleness.lastProgressMs;
+  }
+
+  const age = formatStaleAge(ageMs);
+  return age ? `${label} (${age})` : label;
+}
+
+function formatStalenessSummary(staleness) {
+  if (!staleness || !Array.isArray(staleness.reasons) || staleness.reasons.length === 0) {
+    return null;
+  }
+  const reasons = staleness.reasons
+    .map((reason) => formatStalenessReason(reason, staleness))
+    .filter(Boolean);
+  return reasons.length > 0 ? reasons.join(", ") : null;
+}
+
+function formatStaleInline(job) {
+  const summary = formatStalenessSummary(job?.staleness);
+  return summary ? `stale: ${summary}` : null;
+}
+
+function renderStaleJobsSummary(report) {
+  const visibleStaleCount = Array.isArray(report?.running)
+    ? report.running.filter((job) => formatStalenessSummary(job?.staleness)).length
+    : 0;
+  if (visibleStaleCount === 0) {
+    return "";
+  }
+  return `Stale jobs: ${visibleStaleCount} (see rows)`;
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
   lines.push("| Job | Kind | Invoker | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
@@ -126,8 +179,10 @@ function appendActiveJobsTable(lines, jobs) {
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/codex:cancel ${job.id}`);
     }
+    const staleInline = formatStaleInline(job);
+    const summary = staleInline ? [job.summary ?? "", staleInline].filter(Boolean).join(" | ") : (job.summary ?? "");
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(formatJobInvoker(job))} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(formatJobInvoker(job))} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(summary)} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -148,6 +203,10 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
+  }
+  const stalenessSummary = formatStalenessSummary(job.staleness);
+  if (stalenessSummary) {
+    lines.push(`  Stale: ${stalenessSummary}`);
   }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
@@ -494,9 +553,11 @@ export function renderStatusReport(report) {
 
   appendReviewInvokerAggregate(lines, report.reviewInvokerBreakdown);
 
+  const staleJobsSummary = renderStaleJobsSummary(report);
   const warningsBlock = renderReconciliationWarnings(report?.reconciliationWarnings);
   const trimmedReport = lines.join("\n").trimEnd();
-  return warningsBlock ? `${trimmedReport}\n\n${warningsBlock.trimEnd()}\n` : `${trimmedReport}\n`;
+  const trailingBlocks = [staleJobsSummary, warningsBlock.trimEnd()].filter(Boolean);
+  return trailingBlocks.length > 0 ? `${trimmedReport}\n\n${trailingBlocks.join("\n")}\n` : `${trimmedReport}\n`;
 }
 
 export function renderJobStatusReport(snapshot) {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
@@ -13,7 +15,14 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { deleteSessionJobs, identityVerificationSupported, readPidStartTime } from "./lib/state.mjs";
+import {
+  deleteSessionJobs,
+  identityVerificationSupported,
+  JobLockUnavailableError,
+  readPidStartTime,
+  RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+  reconcileStaleActiveJobs
+} from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -100,9 +109,59 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
-function handleSessionStart(input) {
+function formatIdSummary(ids, maxIds = 3) {
+  const visibleIds = ids.slice(0, maxIds).join(", ");
+  const hiddenCount = ids.length - maxIds;
+  return hiddenCount > 0 ? `${visibleIds} (+${hiddenCount} more)` : visibleIds;
+}
+
+function formatReconcileWarning(warning) {
+  if (!warning || typeof warning !== "object") {
+    return String(warning);
+  }
+  const prefix = warning.jobId ? `${warning.jobId} ` : "";
+  const reason = warning.reason ? `${warning.reason}: ` : "";
+  const message = warning.message ?? "unknown warning";
+  return `${prefix}${reason}${message}`;
+}
+
+export function handleSessionStart(input, reconcileActiveJobs = reconcileStaleActiveJobs) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+
+  const cwd = input.cwd || process.cwd();
+  try {
+    const { reconciledIds = [], warnings = [], staleIds = [] } = reconcileActiveJobs(cwd, { nonblocking: true });
+    if (reconciledIds.length > 0) {
+      process.stderr.write(
+        `[codex-companion] session-start: reaped ${reconciledIds.length} dead/stale jobs (${formatIdSummary(reconciledIds)})\n`
+      );
+    }
+    if (staleIds.length > 0) {
+      process.stderr.write(
+        `[codex-companion] session-start: tagged ${staleIds.length} stale jobs (run /codex:cancel --all-stale to clear)\n`
+      );
+    }
+    for (const warning of warnings) {
+      process.stderr.write(
+        `[codex-companion] session-start: reconcile warning: ${formatReconcileWarning(warning)}\n`
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof JobLockUnavailableError) {
+      process.stderr.write(
+        `[codex-companion] session-start: reconcile warning: ${formatReconcileWarning({
+          jobId: error.jobId ?? null,
+          pid: null,
+          reason: RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+          message
+        })}\n`
+      );
+      return;
+    }
+    process.stderr.write(`[codex-companion] session-start: reconcile failed: ${message}\n`);
+  }
 }
 
 async function handleSessionEnd(input) {
@@ -152,7 +211,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

@@ -267,11 +267,12 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 
 function safeReconcile(workspaceRoot) {
   try {
-    const { reconciledIds, warnings } = reconcileStaleActiveJobs(workspaceRoot);
-    return { reconciledIds, warnings };
+    const { reconciledIds, warnings, staleIds } = reconcileStaleActiveJobs(workspaceRoot);
+    return { reconciledIds, warnings, staleIds: staleIds ?? [] };
   } catch (error) {
     return {
       reconciledIds: [],
+      staleIds: [],
       warnings: [
         {
           jobId: null,
@@ -284,9 +285,18 @@ function safeReconcile(workspaceRoot) {
   }
 }
 
+function filterStaleIdsForJobs(staleIds, jobs) {
+  const jobIds = new Set(jobs.map((job) => job.id));
+  return staleIds.filter((id) => jobIds.has(id));
+}
+
+function filterStaleIdsForSelectedJob(staleIds, job) {
+  return staleIds.includes(job.id) ? [job.id] : [];
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
+  const { warnings: reconciliationWarnings, staleIds } = safeReconcile(workspaceRoot);
   const config = getConfig(workspaceRoot);
   const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const jobs = filterJobsForCurrentSession(workspaceJobs, options);
@@ -311,6 +321,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
     running,
     latestFinished,
     recent,
+    staleIds: filterStaleIdsForJobs(staleIds, jobs),
     reviewInvokerBreakdown: buildReviewInvokerBreakdown(workspaceJobs, options),
     needsReview: Boolean(config.stopReviewGate),
     reconciliationWarnings
@@ -319,7 +330,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
+  const { warnings: reconciliationWarnings, staleIds } = safeReconcile(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
@@ -329,13 +340,14 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   return {
     workspaceRoot,
     job: enrichJob(selected, { maxProgressLines: options.maxProgressLines }),
+    staleIds: filterStaleIdsForSelectedJob(staleIds, selected),
     reconciliationWarnings
   };
 }
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const { warnings: reconciliationWarnings } = safeReconcile(workspaceRoot);
+  const { warnings: reconciliationWarnings, staleIds } = safeReconcile(workspaceRoot);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
@@ -344,7 +356,12 @@ export function resolveResultJob(cwd, reference) {
   );
 
   if (selected) {
-    return { workspaceRoot, job: selected, reconciliationWarnings };
+    return {
+      workspaceRoot,
+      job: selected,
+      staleIds: filterStaleIdsForSelectedJob(staleIds, selected),
+      reconciliationWarnings
+    };
   }
 
   const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");

@@ -21,6 +21,7 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import { CodexAppServerClient } from "./lib/app-server.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { assertInvoker, DEFAULT_INVOKER } from "./lib/invoker.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -32,13 +33,13 @@ import {
   removeReviewSubagents
 } from "./lib/review-subagents.mjs";
 import {
+  classifyCancelIdentity as classifyCancelIdentityUnderLock,
+  commitCancelTombstoneUnderLock,
   generateJobId,
   getConfig,
-  identityVerificationSupported,
   listJobs,
-  getPidStatus,
-  readPidStartTime,
   reconcileStaleActiveJobs,
+  resolveCancelInterruptTimeoutMs,
   setConfig,
   upsertJob
 } from "./lib/state.mjs";
@@ -93,7 +94,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id|--all-stale] [--json] [--force]"
     ].join("\n")
   );
 }
@@ -1052,46 +1053,372 @@ function handleTaskResumeCandidate(argv) {
 }
 
 export function classifyCancelIdentity(storedPid, storedPidStartTime) {
-  const pid = Number(storedPid);
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return { kind: "no-pid", pid: null };
-  }
-  if (!identityVerificationSupported()) {
-    return {
-      kind: "platform-unverifiable",
-      pid,
-      reason: `identity verification not available on platform ${process.platform}`
-    };
-  }
-  if (storedPidStartTime == null || storedPidStartTime === "") {
-    return { kind: "unverifiable", pid, reason: "no recorded pidStartTime" };
-  }
-  const pidStatus = getPidStatus(pid);
-  if (!pidStatus.exists) {
-    return { kind: "dead-no-process", pid, reason: "process no longer exists (ESRCH)" };
-  }
-  if (pidStatus.permissionDenied && pidStatus.sameUser === false) {
-    return { kind: "dead-no-process", pid, reason: "recorded PID now owned by a different user" };
-  }
-  const livePidStartTime = readPidStartTime(pid);
-  if (livePidStartTime == null) {
-    return { kind: "unverifiable", pid, reason: "live pidStartTime unreadable" };
-  }
-  if (String(storedPidStartTime) !== String(livePidStartTime)) {
-    return { kind: "mismatch", pid, reason: "stored pidStartTime no longer matches live process" };
-  }
-  return { kind: "match", pid };
+  return classifyCancelIdentityUnderLock(storedPid, storedPidStartTime);
 }
 
-async function handleCancel(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json", "force"]
+function isActiveJob(job) {
+  return job?.status === "queued" || job?.status === "running";
+}
+
+function createSkippedCancelResult(jobId, reason, job = null) {
+  return {
+    skipped: true,
+    payload: {
+      jobId,
+      status: job?.status ?? "skipped",
+      title: job?.title,
+      turnInterruptAttempted: false,
+      turnInterrupted: false,
+      note: reason
+    }
+  };
+}
+
+function createAllStaleCancelPayload(cancelled, skipped, errors) {
+  return {
+    mode: "all-stale",
+    cancelled,
+    skipped,
+    errors,
+    counts: {
+      cancelled: cancelled.length,
+      skipped: skipped.length,
+      errors: errors.length
+    }
+  };
+}
+
+function renderAllStaleCancelReport(report) {
+  if (report.counts.cancelled === 0 && report.counts.skipped === 0 && report.counts.errors === 0) {
+    return "No stale jobs to cancel.\n";
+  }
+
+  const lines = [
+    "# Codex Cancel",
+    "",
+    `Cancelled ${report.counts.cancelled} stale ${report.counts.cancelled === 1 ? "job" : "jobs"}.`,
+    ""
+  ];
+
+  for (const job of report.cancelled) {
+    lines.push(`- ${job.jobId} -> ${job.status}${job.note ? ` (${job.note})` : ""}`);
+  }
+  for (const skipped of report.skipped) {
+    lines.push(`- ${skipped.jobId} -> skipped: ${skipped.reason}`);
+  }
+  for (const error of report.errors) {
+    lines.push(`- ${error.jobId} -> error: ${error.message}`);
+  }
+
+  lines.push("", "- Check `/codex:status` for the updated queue.");
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function createInterruptTimeoutError(timeoutMs, pid) {
+  const signalDetail =
+    pid === null || pid === undefined ? "sent SIGTERM (no PID recorded)" : `sent SIGTERM to PID ${pid}`;
+  const error = new Error(`interrupt timed out after ${timeoutMs}ms; ${signalDetail}`);
+  error.code = "CODEX_BATCH_INTERRUPT_TIMEOUT";
+  return error;
+}
+
+const BATCH_CLIENT_CLOSE_TIMEOUT_MS = 250;
+
+function createClientCloseTimeoutError(timeoutMs) {
+  const error = new Error(`client close timed out after ${timeoutMs}ms`);
+  error.code = "CODEX_BATCH_CLIENT_CLOSE_TIMEOUT";
+  return error;
+}
+
+async function interruptAppServerTurnForBatch(cwd, params, timeoutMs, pid) {
+  if (!params.threadId || !params.turnId) {
+    return {
+      attempted: false,
+      interrupted: false,
+      transport: null,
+      detail: "missing threadId or turnId"
+    };
+  }
+
+  let timeoutId = null;
+  let forceDestroyed = false;
+  let raceSettled = false;
+  let timedOut = false;
+  const clientRef = { value: null };
+  const forceDestroyReason = () => createInterruptTimeoutError(timeoutMs, pid);
+
+  const closeClientWithTimeout = async (client) => {
+    if (!client) {
+      return;
+    }
+    let closeTimeoutId = null;
+    const closePromise = Promise.resolve()
+      .then(() => client.close())
+      .catch(() => {});
+    const timeoutPromise = new Promise((resolve) => {
+      closeTimeoutId = setTimeout(() => resolve("timeout"), BATCH_CLIENT_CLOSE_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([closePromise.then(() => "closed"), timeoutPromise]);
+    if (closeTimeoutId !== null) {
+      clearTimeout(closeTimeoutId);
+    }
+    if (outcome === "timeout" && !forceDestroyed) {
+      forceDestroyed = true;
+      client.forceDestroy(createClientCloseTimeoutError(BATCH_CLIENT_CLOSE_TIMEOUT_MS));
+    }
+  };
+
+  const closeClientIfAbandoned = async (client) => {
+    if (raceSettled && client && !forceDestroyed) {
+      await closeClientWithTimeout(client);
+    }
+  };
+
+  const interruptPromise = (async () => {
+    let client = null;
+    try {
+      client = await CodexAppServerClient.connect(cwd, {
+        reuseExistingBroker: true,
+        onClient(createdClient) {
+          clientRef.value = createdClient;
+          if (timedOut && !forceDestroyed) {
+            forceDestroyed = true;
+            createdClient.forceDestroy(forceDestroyReason());
+          }
+        }
+      });
+      clientRef.value = client;
+      if (timedOut) {
+        if (!forceDestroyed) {
+          forceDestroyed = true;
+          client.forceDestroy(forceDestroyReason());
+        }
+        throw forceDestroyReason();
+      }
+      await client.request("turn/interrupt", params);
+      return {
+        attempted: true,
+        interrupted: true,
+        transport: client.transport,
+        detail: `Interrupted ${params.turnId} on ${params.threadId}.`
+      };
+    } catch (error) {
+      if (error?.code === "CODEX_BATCH_INTERRUPT_TIMEOUT") {
+        throw error;
+      }
+      return {
+        attempted: true,
+        interrupted: false,
+        transport: client?.transport ?? clientRef.value?.transport ?? null,
+        detail: error instanceof Error ? error.message : String(error)
+      };
+    } finally {
+      await closeClientIfAbandoned(client);
+    }
+  })();
+  interruptPromise.catch(() => {});
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      reject(createInterruptTimeoutError(timeoutMs, pid));
+    }, timeoutMs);
   });
 
-  const cwd = resolveCommandCwd(options);
-  const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  try {
+    return await Promise.race([interruptPromise, timeoutPromise]);
+  } catch (error) {
+    if (error?.code === "CODEX_BATCH_INTERRUPT_TIMEOUT") {
+      timedOut = true;
+      const client = clientRef.value;
+      if (client && !forceDestroyed) {
+        forceDestroyed = true;
+        client.forceDestroy(error);
+      }
+    }
+    throw error;
+  } finally {
+    raceSettled = true;
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+    const client = clientRef.value;
+    if (client && !forceDestroyed) {
+      await closeClientWithTimeout(client);
+    }
+  }
+}
+
+function writeCancelIdentityWarning(identity, options = {}) {
+  if (identity.kind === "platform-unverifiable") {
+    process.stderr.write(
+      `[codex-companion] cancel: PID identity verification not available on ${process.platform}; proceeding to signal recorded PID without identity check.\n`
+    );
+  } else if (identity.kind === "mismatch") {
+    process.stderr.write(
+      `[codex-companion] cancel: target PID no longer matches recorded identity; marking record cancelled without signal.\n`
+    );
+  } else if (identity.kind === "dead-no-process") {
+    process.stderr.write(
+      `[codex-companion] cancel: recorded PID ${identity.pid} no longer exists; marking record cancelled without signal.\n`
+    );
+  } else if (identity.kind === "unverifiable" && options.force) {
+    process.stderr.write(
+      `[codex-companion] cancel: force override — identity unverifiable; signalling recorded PID anyway.\n`
+    );
+  }
+}
+
+function runCancelSignal(identity, options = {}) {
+  if (identity.kind === "match") {
+    terminateProcessTree(identity.pid);
+  } else if (identity.kind === "platform-unverifiable") {
+    if (identity.pid != null) {
+      terminateProcessTree(identity.pid);
+    }
+  } else if (identity.kind === "unverifiable" && options.force) {
+    if (identity.pid != null) {
+      terminateProcessTree(identity.pid);
+    }
+  }
+}
+
+function describeIdentity(identity) {
+  return `${identity.kind}${identity.reason ? ` (${identity.reason})` : ""}`;
+}
+
+function formatCapturedPidStartTime(value) {
+  return value == null || value === "" ? "unknown" : String(value);
+}
+
+function buildPidDriftCleanupError(decision, identity) {
+  return (
+    `PID identity drifted before signal; not signalling captured PID ${decision.pid} ` +
+    `(started at ${formatCapturedPidStartTime(decision.pidStartTime)}): ${describeIdentity(identity)}.`
+  );
+}
+
+function buildPidUnverifiableSignalSkipError(identity) {
+  return (
+    `PID identity ${identity.kind} before signal${identity.reason ? ` (${identity.reason})` : ""}; ` +
+    "re-run /codex:cancel --all-stale --force to signal the captured PID."
+  );
+}
+
+function runRecheckedCancelSignal(decision, options = {}) {
+  if (!decision.signalRequired) {
+    return null;
+  }
+
+  const identity = classifyCancelIdentity(decision.pid, decision.pidStartTime);
+  if (identity.kind === "match") {
+    runCancelSignal(identity, options);
+    return null;
+  }
+
+  if (identity.kind === "mismatch" || identity.kind === "dead-no-process" || identity.kind === "no-pid") {
+    return buildPidDriftCleanupError(decision, identity);
+  }
+
+  if (identity.kind === "platform-unverifiable") {
+    writeCancelIdentityWarning(identity);
+    runCancelSignal(identity, options);
+    return null;
+  }
+
+  if (identity.kind === "unverifiable") {
+    if (options.force) {
+      writeCancelIdentityWarning(identity, { force: true });
+      runCancelSignal(identity, { force: true });
+      return null;
+    }
+    return buildPidUnverifiableSignalSkipError(identity);
+  }
+
+  return buildPidDriftCleanupError(decision, identity);
+}
+
+async function runBatchCancelCleanup(cwd, decision, options = {}) {
+  const cleanupErrors = [];
+  let interrupt = {
+    attempted: false,
+    interrupted: false,
+    transport: null,
+    detail: "missing threadId or turnId"
+  };
+
+  const timeoutMs = resolveCancelInterruptTimeoutMs();
+  const hasTurnIdentity = Boolean(decision.threadId && decision.turnId);
+  if (hasTurnIdentity) {
+    try {
+      interrupt = await interruptAppServerTurnForBatch(
+        cwd,
+        { threadId: decision.threadId, turnId: decision.turnId },
+        timeoutMs,
+        decision.pid
+      );
+      if (!interrupt.interrupted && interrupt.detail) {
+        cleanupErrors.push(interrupt.detail);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      cleanupErrors.push(message);
+      interrupt = {
+        attempted: true,
+        interrupted: false,
+        transport: null,
+        detail: message
+      };
+    }
+  }
+
+  if (interrupt.attempted || hasTurnIdentity) {
+    appendLogLine(
+      decision.logFile,
+      interrupt.interrupted
+        ? `Requested Codex turn interrupt for ${decision.turnId} on ${decision.threadId}.`
+        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+    );
+  }
+
+  try {
+    const signalError = runRecheckedCancelSignal(decision, { force: options.force });
+    if (signalError) {
+      cleanupErrors.push(signalError);
+    }
+  } catch (error) {
+    cleanupErrors.push(error instanceof Error ? error.message : String(error));
+  }
+
+  appendLogLine(decision.logFile, "Cancelled by user.");
+
+  return {
+    interrupt,
+    cleanupError: cleanupErrors.length > 0 ? cleanupErrors.join("; ") : null
+  };
+}
+
+async function cancelOneStaleJob(workspaceRoot, job, options = {}) {
+  const cwd = options.cwd ?? workspaceRoot;
+  if (options.allStale) {
+    const decision = commitCancelTombstoneUnderLock(workspaceRoot, job.id, { force: options.force });
+    if (decision.outcome === "skipped") {
+      return createSkippedCancelResult(job.id, decision.reason, decision.renderedJob);
+    }
+
+    const cleanup = await runBatchCancelCleanup(cwd, decision, { force: options.force });
+    const payload = {
+      jobId: decision.renderedJob.id,
+      status: decision.renderedJob.status,
+      title: decision.renderedJob.title,
+      turnInterruptAttempted: cleanup.interrupt.attempted,
+      turnInterrupted: cleanup.interrupt.interrupted,
+      ...(cleanup.cleanupError ? { cleanupError: cleanup.cleanupError } : {})
+    };
+
+    return { payload, renderedJob: decision.renderedJob, cleanupError: cleanup.cleanupError };
+  }
+
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
@@ -1115,7 +1442,7 @@ async function handleCancel(argv) {
       `Use /codex:cancel --force ${job.id} to override and signal the recorded PID anyway.`;
     process.stderr.write(`${message}\n`);
     process.exitCode = 1;
-    return;
+    return null;
   }
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
@@ -1180,6 +1507,7 @@ async function handleCancel(argv) {
         ? "Job had already completed; no action taken."
         : `Job is already ${returnedJob.status}; no action taken.`;
   const renderedJob = cancelNote ? { ...returnedJob, cancelNote } : returnedJob;
+  const note = [cancelNote].filter(Boolean).join(" ");
 
   const payload = {
     jobId: job.id,
@@ -1187,10 +1515,113 @@ async function handleCancel(argv) {
     title: returnedJob.title,
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted,
-    ...(cancelNote ? { note: cancelNote } : {})
+    ...(note ? { note } : {})
   };
 
-  outputCommandResult(payload, renderCancelReport(renderedJob), options.json);
+  return { payload, renderedJob };
+}
+
+async function handleCancelAllStale(cwd, workspaceRoot, options) {
+  const { staleIds, warnings } = reconcileStaleActiveJobs(workspaceRoot);
+  const cancelled = [];
+  const skipped = [];
+  const errors = (warnings ?? [])
+    .filter((warning) => warning?.reason === "reconcile-error")
+    .map((warning) => ({
+      jobId: warning.jobId ?? null,
+      message: warning.message ?? "Failed to assess active job staleness."
+    }));
+
+  if ((staleIds?.length ?? 0) === 0) {
+    const payload = createAllStaleCancelPayload(cancelled, skipped, errors);
+    outputCommandResult(payload, renderAllStaleCancelReport(payload), options.json);
+    if (errors.length > 0) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const jobsById = new Map(listJobs(workspaceRoot).map((job) => [job.id, job]));
+
+  for (const jobId of staleIds) {
+    const job = jobsById.get(jobId);
+    if (!job) {
+      skipped.push({ jobId, reason: "Job no longer exists." });
+      continue;
+    }
+    if (!isActiveJob(job)) {
+      skipped.push({ jobId, reason: `Job is already ${job.status ?? "not active"}.` });
+      continue;
+    }
+
+    try {
+      const result = await cancelOneStaleJob(workspaceRoot, job, {
+        cwd,
+        force: options.force,
+        allStale: true
+      });
+      if (result.skipped) {
+        skipped.push({
+          jobId,
+          status: result.payload.status,
+          reason: result.payload.note ?? "No action taken."
+        });
+      } else if (result.payload.status === "cancelled") {
+        cancelled.push(result.payload);
+        if (result.cleanupError) {
+          errors.push({
+            jobId,
+            message: result.cleanupError
+          });
+        }
+      } else {
+        skipped.push({
+          jobId,
+          status: result.payload.status,
+          reason: result.payload.note ?? `Job is already ${result.payload.status}; no action taken.`
+        });
+      }
+    } catch (error) {
+      errors.push({
+        jobId,
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  const payload = createAllStaleCancelPayload(cancelled, skipped, errors);
+  outputCommandResult(payload, renderAllStaleCancelReport(payload), options.json);
+  if (errors.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
+async function handleCancel(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "force", "all-stale"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  if (options["all-stale"] && reference) {
+    throw new Error("Pass either a job id or --all-stale, not both.");
+  }
+
+  if (options["all-stale"]) {
+    await handleCancelAllStale(cwd, resolveWorkspaceRoot(cwd), options);
+    return;
+  }
+
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  const result = await cancelOneStaleJob(workspaceRoot, job, {
+    cwd,
+    force: options.force
+  });
+  if (!result) {
+    return;
+  }
+  outputCommandResult(result.payload, renderCancelReport(result.renderedJob), options.json);
 }
 
 async function main() {

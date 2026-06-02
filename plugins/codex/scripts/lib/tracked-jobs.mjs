@@ -5,6 +5,7 @@ import process from "node:process";
 import {
   readJobFile,
   readPidStartTime,
+  resolveProgressTimeoutMs,
   resolveJobFile,
   resolveJobLogFile,
   upsertJob,
@@ -13,6 +14,7 @@ import {
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export const PROGRESS_UPDATE_THROTTLE_MS = 5_000;
 const TRANSIENT_APPEND_ERROR_CODES = new Set(["EACCES", "EBUSY", "EAGAIN", "EPERM", "EMFILE", "ENFILE", "EINTR"]);
 const APPEND_RETRY_DELAYS_MS = [5, 10];
 const appendCircuitOpenByLogFile = new Map();
@@ -201,11 +203,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastProgressUpdateMs = Number.NEGATIVE_INFINITY;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
+    const currentMs = Date.now();
 
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;
@@ -222,6 +226,12 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.turnId && normalized.turnId !== lastTurnId) {
       lastTurnId = normalized.turnId;
       patch.turnId = normalized.turnId;
+      changed = true;
+    }
+
+    if (currentMs - lastProgressUpdateMs >= PROGRESS_UPDATE_THROTTLE_MS) {
+      lastProgressUpdateMs = currentMs;
+      patch.progressUpdatedAt = nowIso();
       changed = true;
     }
 
@@ -299,6 +309,7 @@ export async function runTrackedJob(job, runner, options = {}) {
 
     const baseRecord = existing ?? job;
     const timestamp = nowIso();
+    const progressTimeoutMs = resolveProgressTimeoutMs();
     runningRecord = {
       ...baseRecord,
       id: job.id,
@@ -308,6 +319,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       pidStartTime: readPidStartTime(process.pid),
       pidStartedAtMs: Date.now(),
       startedAt: timestamp,
+      progressUpdatedAt: timestamp,
+      progressTimeoutMs,
       updatedAt: timestamp,
       logFile: options.logFile ?? baseRecord.logFile ?? job.logFile ?? null
     };
@@ -339,6 +352,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
+      staleness: null,
+      progressUpdatedAt: null,
       summary: execution.summary,
       result: execution.payload,
       rendered: execution.rendered,
@@ -357,6 +372,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       pid: null,
       completedAt,
+      staleness: null,
+      progressUpdatedAt: null,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });
     throw error;

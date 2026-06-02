@@ -25,19 +25,100 @@ const TERMINAL_STICKY_FIELDS = [
   "rendered",
   "pid",
   "pidStartTime",
-  "pidStartedAtMs"
+  "pidStartedAtMs",
+  "progressTimeoutMs"
 ];
 const JOB_LOCK_RETRY_COUNT = 200;
 const JOB_LOCK_RETRY_DELAY_MS = 25;
 const JOB_LOCK_INCOMPLETE_STALE_MS = JOB_LOCK_RETRY_COUNT * JOB_LOCK_RETRY_DELAY_MS;
 const JOB_LOCK_STALE_MS = 60_000;
 const JOB_LOCK_SLEEP_VIEW = new Int32Array(new SharedArrayBuffer(4));
+
+// Stale-job detection constants
+export const STALE_TTL_TASK_MS_DEFAULT = 3_600_000;
+export const STALE_TTL_REVIEW_MS_DEFAULT = 900_000;
+export const PROGRESS_TIMEOUT_MS_DEFAULT = 300_000;
+export const CANCEL_INTERRUPT_TIMEOUT_MS_DEFAULT = 5_000;
+const STALE_TTL_MIN_MS = 60_000;
+const STALE_TTL_MAX_MS = 86_400_000;
+const PROGRESS_TIMEOUT_MIN_MS = 30_000;
+const PROGRESS_TIMEOUT_MAX_MS = 3_600_000;
+export const STALE_REASONS_CANONICAL_ORDER = Object.freeze(["ttl-exceeded", "progress-stalled"]);
+export const RECONCILE_WARNING_REASON_RECONCILE_SKIPPED = "reconcile-skipped";
+
+// Module-level Set to dedupe env-var warnings per process lifetime
+const _envVarWarnedSet = new Set();
+
+export function __resetEnvVarWarningsForTest() {
+  _envVarWarnedSet.clear();
+}
+
+function _resolveEnvMs(envVarName, defaultMs, minMs, maxMs, env = process.env) {
+  const raw = env[envVarName];
+  if (raw === undefined || raw === null) {
+    return defaultMs;
+  }
+  const isPlainDecimalInteger = typeof raw === "string" && /^[1-9][0-9]*$/.test(raw);
+  const num = isPlainDecimalInteger ? Number(raw) : NaN;
+  const valid =
+    isPlainDecimalInteger &&
+    Number.isInteger(num) &&
+    num > 0 &&
+    Number.isFinite(num) &&
+    num >= minMs &&
+    num <= maxMs;
+  if (!valid) {
+    if (!_envVarWarnedSet.has(envVarName)) {
+      _envVarWarnedSet.add(envVarName);
+      process.stderr.write(
+        `[codex-companion] Warning: invalid value for ${envVarName}: "${raw}". Using default ${defaultMs}ms.\n`
+      );
+    }
+    return defaultMs;
+  }
+  return num;
+}
+
+export function resolveStaleTtlTaskMs(env = process.env) {
+  return _resolveEnvMs("CODEX_PLUGIN_STALE_TTL_TASK_MS", STALE_TTL_TASK_MS_DEFAULT, STALE_TTL_MIN_MS, STALE_TTL_MAX_MS, env);
+}
+
+export function resolveStaleTtlReviewMs(env = process.env) {
+  return _resolveEnvMs("CODEX_PLUGIN_STALE_TTL_REVIEW_MS", STALE_TTL_REVIEW_MS_DEFAULT, STALE_TTL_MIN_MS, STALE_TTL_MAX_MS, env);
+}
+
+export function resolveProgressTimeoutMs(env = process.env) {
+  return _resolveEnvMs("CODEX_PLUGIN_PROGRESS_TIMEOUT_MS", PROGRESS_TIMEOUT_MS_DEFAULT, PROGRESS_TIMEOUT_MIN_MS, PROGRESS_TIMEOUT_MAX_MS, env);
+}
+
+export function resolveCancelInterruptTimeoutMs(env = process.env) {
+  return _resolveEnvMs(
+    "CODEX_PLUGIN_CANCEL_INTERRUPT_TIMEOUT_MS",
+    CANCEL_INTERRUPT_TIMEOUT_MS_DEFAULT,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    env
+  );
+}
 const SAFE_JOB_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
-class JobLockTimeoutError extends Error {
+class JobLockAcquisitionError extends Error {
+  constructor(name, message, jobId) {
+    super(message);
+    this.name = name;
+    this.jobId = jobId;
+  }
+}
+
+class JobLockTimeoutError extends JobLockAcquisitionError {
   constructor(jobId) {
-    super(`Timed out acquiring job lock for ${jobId}.`);
-    this.name = "JobLockTimeoutError";
+    super("JobLockTimeoutError", `Timed out acquiring job lock for ${jobId}.`, jobId);
+  }
+}
+
+export class JobLockUnavailableError extends JobLockAcquisitionError {
+  constructor(jobId) {
+    super("JobLockUnavailableError", `Job lock for ${jobId} is currently held.`, jobId);
   }
 }
 
@@ -340,6 +421,38 @@ export function getPidStatus(pid) {
   }
 }
 
+export function classifyCancelIdentity(storedPid, storedPidStartTime) {
+  const pid = Number(storedPid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { kind: "no-pid", pid: null };
+  }
+  if (!identityVerificationSupported()) {
+    return {
+      kind: "platform-unverifiable",
+      pid,
+      reason: `identity verification not available on platform ${process.platform}`
+    };
+  }
+  if (storedPidStartTime == null || storedPidStartTime === "") {
+    return { kind: "unverifiable", pid, reason: "no recorded pidStartTime" };
+  }
+  const pidStatus = getPidStatus(pid);
+  if (!pidStatus.exists) {
+    return { kind: "dead-no-process", pid, reason: "process no longer exists (ESRCH)" };
+  }
+  if (pidStatus.permissionDenied && pidStatus.sameUser === false) {
+    return { kind: "dead-no-process", pid, reason: "recorded PID now owned by a different user" };
+  }
+  const livePidStartTime = readPidStartTime(pid);
+  if (livePidStartTime == null) {
+    return { kind: "unverifiable", pid, reason: "live pidStartTime unreadable" };
+  }
+  if (String(storedPidStartTime) !== String(livePidStartTime)) {
+    return { kind: "mismatch", pid, reason: "stored pidStartTime no longer matches live process" };
+  }
+  return { kind: "match", pid };
+}
+
 function isLockFileOlderThan(lockPath, ageMs) {
   try {
     return Date.now() - fs.statSync(lockPath).mtimeMs > ageMs;
@@ -636,9 +749,10 @@ function publishJobLock(lockPath, token) {
   }
 }
 
-function acquireJobLock(cwd, jobId) {
+function acquireJobLock(cwd, jobId, options = {}) {
   const lockPath = resolveJobLockFile(cwd, jobId);
   const token = createJobLockToken();
+  const nonblocking = Boolean(options.nonblocking);
   let attempts = 0;
 
   for (;;) {
@@ -652,12 +766,18 @@ function acquireJobLock(cwd, jobId) {
       }
     }
 
-    if (attempts >= JOB_LOCK_RETRY_COUNT) {
+    if (nonblocking || attempts >= JOB_LOCK_RETRY_COUNT) {
       const staleSnapshot = getStaleJobLockSnapshot(lockPath);
       if (staleSnapshot.stale && !hasRecentBlockingJobLockSideFile(lockPath)) {
-        stealStaleJobLock(lockPath, staleSnapshot, token);
+        const stolen = stealStaleJobLock(lockPath, staleSnapshot, token);
+        if (nonblocking && !stolen) {
+          throw new JobLockUnavailableError(jobId);
+        }
         attempts = 0;
         continue;
+      }
+      if (nonblocking) {
+        throw new JobLockUnavailableError(jobId);
       }
       throw new JobLockTimeoutError(jobId);
     }
@@ -667,9 +787,9 @@ function acquireJobLock(cwd, jobId) {
   }
 }
 
-export function withJobLock(cwd, jobId, fn) {
+export function withJobLock(cwd, jobId, fn, options = {}) {
   // Per-job lock serializes cross-process read/write and prune/delete critical sections.
-  const { lockPath, token } = acquireJobLock(cwd, jobId);
+  const { lockPath, token } = acquireJobLock(cwd, jobId, options);
   try {
     return fn(() => revalidateJobLock(lockPath, token, jobId));
   } finally {
@@ -702,6 +822,10 @@ function preserveTerminalJob(existing, nextJob) {
       delete preserved[field];
     }
   }
+
+  // Explicitly clear active-only fields that must not survive terminal transition
+  preserved.staleness = null;
+  preserved.progressUpdatedAt = null;
 
   return preserved;
 }
@@ -801,6 +925,12 @@ export function upsertJob(cwd, jobPatch) {
         };
     if (existing && isTerminalJobStatus(existing.status)) {
       mergedJob = preserveTerminalJob(existing, mergedJob);
+    }
+
+    // Explicitly clear active-only fields on terminal transition
+    if (isTerminalJobStatus(mergedJob.status)) {
+      mergedJob.staleness = null;
+      mergedJob.progressUpdatedAt = null;
     }
 
     writeJobFileUnlocked(cwd, jobPatch.id, mergedJob, { beforeRename: revalidateLock });
@@ -939,11 +1069,234 @@ function classifyActiveJobForReconciliation(job) {
   };
 }
 
+function computeLockedStaleReasons(currentRecord, snapshot, nowMs = Date.now()) {
+  const reasons = [];
+
+  const startedAtMs = Date.parse(currentRecord.startedAt ?? "");
+  const ageMs = nowMs - startedAtMs;
+  if (Number.isFinite(ageMs) && Number.isFinite(snapshot.ttlMs) && ageMs > snapshot.ttlMs) {
+    reasons.push("ttl-exceeded");
+  }
+
+  const progressBaseMs = Date.parse(currentRecord.progressUpdatedAt ?? currentRecord.startedAt ?? "");
+  const progressAgeMs = nowMs - progressBaseMs;
+  if (
+    Number.isFinite(progressAgeMs) &&
+    Number.isFinite(snapshot.progressTimeoutMs) &&
+    progressAgeMs > snapshot.progressTimeoutMs
+  ) {
+    reasons.push("progress-stalled");
+  }
+
+  return reasons.sort(
+    (a, b) => STALE_REASONS_CANONICAL_ORDER.indexOf(a) - STALE_REASONS_CANONICAL_ORDER.indexOf(b)
+  );
+}
+
+function computeStalenessForRecord(currentRecord, snapshot) {
+  const effectiveTtlMs = isReviewJob(currentRecord) ? snapshot.ttlReviewMs : snapshot.ttlTaskMs;
+  const effectiveProgressTimeoutMs = currentRecord.progressTimeoutMs ?? snapshot.progressTimeoutMs;
+  return {
+    staleReasons: computeLockedStaleReasons(currentRecord, {
+      ttlMs: effectiveTtlMs,
+      progressTimeoutMs: effectiveProgressTimeoutMs
+    }),
+    ttlMs: effectiveTtlMs ?? null,
+    progressTimeoutMs: effectiveProgressTimeoutMs ?? null
+  };
+}
+
+function signalRequiredForCancelIdentity(identity, force) {
+  if (identity.kind === "match") {
+    return true;
+  }
+  if (identity.kind === "platform-unverifiable") {
+    return identity.pid != null;
+  }
+  if (identity.kind === "unverifiable" && force) {
+    return identity.pid != null;
+  }
+  return false;
+}
+
+function buildUnverifiableCancelSkipReason(jobId, identity) {
+  return (
+    `PID identity unverifiable (${identity.reason}); ` +
+    `re-run /codex:cancel --all-stale --force (or /codex:cancel --force ${jobId}) to signal it.`
+  );
+}
+
+export function applyStalenessUnderLock(workspaceRoot, jobId, classificationSnapshot, options = {}) {
+  return withJobLock(workspaceRoot, jobId, (revalidateLock) => {
+    const snapshot = classificationSnapshot ?? {};
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    let currentRecord = null;
+    try {
+      currentRecord = readJobFile(jobFile);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return { wrote: false, staleReasons: [] };
+      }
+      throw error;
+    }
+
+    // Abort if terminal
+    if (isTerminalJobStatus(currentRecord.status)) {
+      return { wrote: false, staleReasons: [] };
+    }
+
+    // Abort if PID identity changed (treat both null as equal)
+    const snapshotPid = snapshot.pid ?? null;
+    const snapshotPidStartTime = snapshot.pidStartTime ?? null;
+    const recordPid = currentRecord.pid ?? null;
+    const recordPidStartTime = currentRecord.pidStartTime ?? null;
+    if (recordPid !== snapshotPid) {
+      return { wrote: false, staleReasons: [] };
+    }
+    if (String(recordPidStartTime ?? "") !== String(snapshotPidStartTime ?? "")) {
+      return { wrote: false, staleReasons: [] };
+    }
+
+    const {
+      staleReasons: sortedReasons,
+      ttlMs: effectiveTtlMs,
+      progressTimeoutMs: effectiveProgressTimeoutMs
+    } = computeStalenessForRecord(currentRecord, snapshot);
+    const hasNoStaleReasons = sortedReasons.length === 0;
+
+    // No-op: clearing but already null
+    if (hasNoStaleReasons && currentRecord.staleness == null) {
+      return { wrote: false, staleReasons: [] };
+    }
+
+    // No-op: same reasons already set (in canonical order)
+    if (!hasNoStaleReasons && currentRecord.staleness?.reasons != null) {
+      const existing = currentRecord.staleness.reasons;
+      if (
+        sortedReasons.length === existing.length &&
+        sortedReasons.every((r, i) => r === existing[i])
+      ) {
+        return { wrote: false, staleReasons: sortedReasons };
+      }
+    }
+
+    let staleness;
+    if (hasNoStaleReasons) {
+      staleness = null;
+    } else {
+      const ageMs = Date.now() - Date.parse(currentRecord.startedAt ?? "");
+      const lastProgressRaw = Date.parse(currentRecord.progressUpdatedAt ?? currentRecord.startedAt ?? "");
+      staleness = {
+        reasons: sortedReasons,
+        detectedAt: nowIso(),
+        ageMs: Number.isFinite(ageMs) && !Number.isNaN(ageMs) ? ageMs : 0,
+        lastProgressMs: Number.isFinite(lastProgressRaw) && !Number.isNaN(lastProgressRaw) ? lastProgressRaw : null,
+        ttlMs: effectiveTtlMs ?? null,
+        progressTimeoutMs: effectiveProgressTimeoutMs ?? null
+      };
+    }
+
+    const patch = {
+      ...currentRecord,
+      staleness,
+      updatedAt: nowIso()
+    };
+
+    writeJobFileUnlocked(workspaceRoot, jobId, patch, { beforeRename: revalidateLock });
+    return { wrote: true, staleReasons: sortedReasons };
+  }, options);
+}
+
+export function commitCancelTombstoneUnderLock(workspaceRoot, jobId, options = {}) {
+  const force = Boolean(options.force);
+  const snapshot = {
+    ttlTaskMs: resolveStaleTtlTaskMs(),
+    ttlReviewMs: resolveStaleTtlReviewMs(),
+    progressTimeoutMs: resolveProgressTimeoutMs()
+  };
+
+  return withJobLock(workspaceRoot, jobId, (revalidateLock) => {
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    let currentRecord = null;
+    try {
+      currentRecord = readJobFile(jobFile);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return { outcome: "skipped", reason: "Job no longer exists.", renderedJob: null };
+      }
+      throw error;
+    }
+
+    if (!isActiveJobStatus(currentRecord.status)) {
+      return {
+        outcome: "skipped",
+        reason: `Job is already ${currentRecord.status ?? "not active"}.`,
+        renderedJob: currentRecord
+      };
+    }
+
+    const { staleReasons } = computeStalenessForRecord(currentRecord, snapshot);
+    if (staleReasons.length === 0) {
+      return {
+        outcome: "skipped",
+        reason: "Job is no longer stale.",
+        renderedJob: currentRecord
+      };
+    }
+
+    const identity = classifyCancelIdentity(currentRecord.pid, currentRecord.pidStartTime);
+    if (identity.kind === "unverifiable" && !force) {
+      return {
+        outcome: "skipped",
+        reason: buildUnverifiableCancelSkipReason(jobId, identity),
+        identity,
+        identityKind: identity.kind,
+        renderedJob: currentRecord
+      };
+    }
+
+    const timestamp = nowIso();
+    const renderedJob = {
+      ...currentRecord,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt: timestamp,
+      cancelledAt: timestamp,
+      updatedAt: timestamp,
+      errorMessage: "Cancelled by user.",
+      staleness: null,
+      progressUpdatedAt: null
+    };
+    writeJobFileUnlocked(workspaceRoot, jobId, renderedJob, { beforeRename: revalidateLock });
+
+    return {
+      outcome: "committed",
+      identity,
+      identityKind: identity.kind,
+      pid: identity.pid ?? null,
+      pidStartTime: currentRecord.pidStartTime ?? null,
+      threadId: currentRecord.threadId ?? null,
+      turnId: currentRecord.turnId ?? null,
+      logFile: currentRecord.logFile ?? null,
+      signalRequired: signalRequiredForCancelIdentity(identity, force),
+      staleReasons,
+      renderedJob
+    };
+  });
+}
+
 export function reconcileStaleActiveJobs(cwd, options = {}) {
-  void options;
+  const {
+    ttlTaskMs = resolveStaleTtlTaskMs(),
+    ttlReviewMs = resolveStaleTtlReviewMs(),
+    progressTimeoutMs = resolveProgressTimeoutMs(),
+    nonblocking = false
+  } = options;
 
   const reconciledIds = [];
   const warnings = [];
+  const staleIds = [];
 
   try {
     const jobs = listJobs(cwd);
@@ -957,55 +1310,106 @@ export function reconcileStaleActiveJobs(cwd, options = {}) {
         if (classification.warning) {
           warnings.push(classification.warning);
         }
-        if (!classification.dead) {
+
+        if (classification.dead) {
+          try {
+            withJobLock(cwd, job.id, (revalidateLock) => {
+              const jobFile = resolveJobFile(cwd, job.id);
+              let currentJob = null;
+              try {
+                currentJob = readJobFile(jobFile);
+              } catch (error) {
+                if (error?.code !== "ENOENT") {
+                  throw error;
+                }
+                return;
+              }
+
+              if (currentJob.updatedAt !== job.updatedAt || !isActiveJobStatus(currentJob.status)) {
+                return;
+              }
+
+              // Re-verify the identity that the out-of-lock classification was
+              // based on. If pid or pidStartTime changed between classification
+              // and lock acquisition, the record is no longer the one we
+              // classified dead — abort to avoid terminalizing a different
+              // process identity.
+              const sameIdentity =
+                (currentJob.pid ?? null) === (job.pid ?? null) &&
+                (currentJob.pidStartTime ?? null) === (job.pidStartTime ?? null);
+              if (!sameIdentity) {
+                return;
+              }
+
+              const timestamp = nowIso();
+              writeJobFileUnlocked(
+                cwd,
+                job.id,
+                {
+                  ...currentJob,
+                  status: "failed",
+                  phase: "failed",
+                  pid: null,
+                  completedAt: timestamp,
+                  updatedAt: timestamp,
+                  errorMessage: "Process exited without writing a terminal state.",
+                  staleness: null,
+                  progressUpdatedAt: null
+                },
+                { beforeRename: revalidateLock }
+              );
+              reconciledIds.push(job.id);
+            }, { nonblocking });
+          } catch (error) {
+            if (error instanceof JobLockUnavailableError) {
+              const message = error.message;
+              warnings.push(
+                makeReconcileWarning(
+                  job?.id ?? null,
+                  classification.pid ?? normalizePid(job?.pid),
+                  RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+                  message
+                )
+              );
+              continue;
+            }
+            throw error;
+          }
+          // Skip stale-but-alive detection for terminalized jobs
           continue;
         }
 
-        withJobLock(cwd, job.id, (revalidateLock) => {
-          const jobFile = resolveJobFile(cwd, job.id);
-          let currentJob = null;
-          try {
-            currentJob = readJobFile(jobFile);
-          } catch (error) {
-            if (error?.code !== "ENOENT") {
-              throw error;
-            }
-            return;
-          }
+        // Stale-but-alive detection (includes unverifiable-identity records)
+        const snapshot = {
+          pid: job.pid ?? null,
+          pidStartTime: job.pidStartTime ?? null,
+          ttlTaskMs,
+          ttlReviewMs,
+          progressTimeoutMs
+        };
 
-          if (currentJob.updatedAt !== job.updatedAt || !isActiveJobStatus(currentJob.status)) {
-            return;
+        let stalenessResult = { wrote: false, staleReasons: [] };
+        try {
+          stalenessResult = applyStalenessUnderLock(cwd, job.id, snapshot, { nonblocking });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof JobLockUnavailableError) {
+            warnings.push(
+              makeReconcileWarning(
+                job?.id ?? null,
+                normalizePid(job?.pid),
+                RECONCILE_WARNING_REASON_RECONCILE_SKIPPED,
+                message
+              )
+            );
+            continue;
           }
+          warnings.push(makeReconcileWarning(job?.id ?? null, normalizePid(job?.pid), "reconcile-error", message));
+        }
 
-          // Re-verify the identity that the out-of-lock classification was
-          // based on. If pid or pidStartTime changed between classification
-          // and lock acquisition, the record is no longer the one we
-          // classified dead — abort to avoid terminalizing a different
-          // process identity.
-          const sameIdentity =
-            (currentJob.pid ?? null) === (job.pid ?? null) &&
-            (currentJob.pidStartTime ?? null) === (job.pidStartTime ?? null);
-          if (!sameIdentity) {
-            return;
-          }
-
-          const timestamp = nowIso();
-          writeJobFileUnlocked(
-            cwd,
-            job.id,
-            {
-              ...currentJob,
-              status: "failed",
-              phase: "failed",
-              pid: null,
-              completedAt: timestamp,
-              updatedAt: timestamp,
-              errorMessage: "Process exited without writing a terminal state."
-            },
-            { beforeRename: revalidateLock }
-          );
-          reconciledIds.push(job.id);
-        });
+        if ((stalenessResult.staleReasons?.length ?? 0) > 0) {
+          staleIds.push(job.id);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         warnings.push(makeReconcileWarning(job?.id ?? null, normalizePid(job?.pid), "reconcile-error", message));
@@ -1015,11 +1419,12 @@ export function reconcileStaleActiveJobs(cwd, options = {}) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       reconciledIds: [],
-      warnings: [makeReconcileWarning(null, null, "reconcile-error", message)]
+      warnings: [makeReconcileWarning(null, null, "reconcile-error", message)],
+      staleIds: []
     };
   }
 
-  return { reconciledIds, warnings };
+  return { reconciledIds, warnings, staleIds };
 }
 
 export function setConfig(cwd, key, value) {
@@ -1187,7 +1592,9 @@ export function deleteSessionJobs(cwd, sessionId, options = undefined) {
               completedAt: timestamp,
               errorMessage: "Cancelled by session end.",
               cancelledAt: timestamp,
-              updatedAt: timestamp
+              updatedAt: timestamp,
+              staleness: null,
+              progressUpdatedAt: null
             },
             { beforeRename: revalidateLock }
           );

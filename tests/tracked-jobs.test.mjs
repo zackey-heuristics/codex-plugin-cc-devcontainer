@@ -2,22 +2,33 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  PROGRESS_UPDATE_THROTTLE_MS,
   __resetAppendFileSyncForTest,
   __resetCircuitBreakerForTest,
   __setAppendFileSyncForTest,
   appendLogBlock,
   appendLogLine,
   createJobLogFile,
+  runTrackedJob,
   safeAppendFileSync
 } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
-import { resolveJobLogFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const realAppendFileSync = fs.appendFileSync.bind(fs);
+const trackedJobsSourceFile = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../plugins/codex/scripts/lib/tracked-jobs.mjs"
+);
 
 let restoreStderrWrite = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function makeError(code) {
   const error = new Error(`${code} fixture`);
@@ -39,6 +50,93 @@ function captureStderrWrite() {
     restoreStderrWrite = null;
   };
   return writes;
+}
+
+async function importTrackedJobsWithStateStub() {
+  const tempDir = makeTempDir();
+  const token = `trackedJobsStateStub_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const stub = {
+    pidStartTime: "stub-pid-start",
+    progressTimeoutMs: 60_000,
+    readPidStartTimeCalls: 0,
+    resolveProgressTimeoutCalls: 0,
+    revalidateCalls: 0,
+    upsertCalls: [],
+    writes: []
+  };
+  globalThis[token] = stub;
+
+  fs.writeFileSync(path.join(tempDir, "tracked-jobs.mjs"), fs.readFileSync(trackedJobsSourceFile, "utf8"), "utf8");
+  fs.writeFileSync(
+    path.join(tempDir, "state.mjs"),
+    `
+const stub = globalThis[${JSON.stringify(token)}];
+
+function clone(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function missingFileError() {
+  const error = new Error("ENOENT");
+  error.code = "ENOENT";
+  return error;
+}
+
+export function readJobFile(file) {
+  if (typeof stub.readJobFile === "function") {
+    return clone(stub.readJobFile(file));
+  }
+  throw missingFileError();
+}
+
+export function readPidStartTime() {
+  stub.readPidStartTimeCalls += 1;
+  return stub.pidStartTime;
+}
+
+export function resolveJobFile(cwd, jobId) {
+  return String(cwd).replace(/\\/$/, "") + "/" + jobId + ".json";
+}
+
+export function resolveJobLogFile(cwd, jobId) {
+  return String(cwd).replace(/\\/$/, "") + "/" + jobId + ".log";
+}
+
+export function resolveProgressTimeoutMs() {
+  stub.resolveProgressTimeoutCalls += 1;
+  return stub.progressTimeoutMs;
+}
+
+export function upsertJob(cwd, patch) {
+  const clonedPatch = clone(patch);
+  stub.upsertCalls.push({ cwd, patch: clonedPatch });
+  return clonedPatch;
+}
+
+export function withJobLock(_cwd, _jobId, fn) {
+  return fn(() => {
+    stub.revalidateCalls += 1;
+  });
+}
+
+export function writeJobFileUnlocked(cwd, jobId, payload) {
+  const clonedPayload = clone(payload);
+  stub.writes.push({ cwd, jobId, payload: clonedPayload });
+  return resolveJobFile(cwd, jobId);
+}
+`,
+    "utf8"
+  );
+
+  const module = await import(`${pathToFileURL(path.join(tempDir, "tracked-jobs.mjs")).href}?${token}`);
+  return {
+    module,
+    stub,
+    cleanup() {
+      delete globalThis[token];
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  };
 }
 
 test.beforeEach(() => {
@@ -215,4 +313,146 @@ test("createJobLogFile still throws on initial-write failure", () => {
   assert.throws(() => createJobLogFile(workspace, jobId, "Initial write"), {
     code: "EISDIR"
   });
+});
+
+test("runTrackedJob writes progress timeout and seeds progress timestamp on the running record", async () => {
+  const workspace = makeTempDir();
+  const jobId = "tracked-progress-baseline";
+  const logFile = resolveJobLogFile(workspace, jobId);
+  const createdAt = new Date().toISOString();
+  const previousProgressTimeout = process.env.CODEX_PLUGIN_PROGRESS_TIMEOUT_MS;
+  process.env.CODEX_PLUGIN_PROGRESS_TIMEOUT_MS = "60000";
+  fs.writeFileSync(logFile, "", "utf8");
+
+  let resolveRunnerStarted;
+  let releaseRunner;
+  const runnerStarted = new Promise((resolve) => {
+    resolveRunnerStarted = resolve;
+  });
+  const runnerCanFinish = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+
+  const runPromise = runTrackedJob(
+    {
+      id: jobId,
+      workspaceRoot: workspace,
+      status: "queued",
+      phase: "queued",
+      createdAt,
+      updatedAt: createdAt,
+      logFile
+    },
+    async () => {
+      resolveRunnerStarted();
+      await runnerCanFinish;
+      return { exitStatus: 0, threadId: null, turnId: null, summary: "ok", payload: { ok: true }, rendered: "done" };
+    },
+    { logFile }
+  );
+
+  try {
+    await Promise.race([
+      runnerStarted,
+      sleep(5000).then(() => {
+        throw new Error("Timed out waiting for runner to start.");
+      })
+    ]);
+
+    const running = readJobFile(resolveJobFile(workspace, jobId));
+    assert.equal(running.status, "running");
+    assert.equal(running.phase, "starting");
+    assert.equal(running.progressTimeoutMs, 60_000);
+    assert.equal(running.progressUpdatedAt, running.startedAt);
+  } finally {
+    releaseRunner();
+    if (previousProgressTimeout === undefined) {
+      delete process.env.CODEX_PLUGIN_PROGRESS_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_PLUGIN_PROGRESS_TIMEOUT_MS = previousProgressTimeout;
+    }
+  }
+
+  const execution = await runPromise;
+  assert.equal(execution.exitStatus, 0);
+});
+
+test("createJobProgressUpdater refreshes progressUpdatedAt on same-phase events after the throttle window", async () => {
+  const { module, stub, cleanup } = await importTrackedJobsWithStateStub();
+  const originalDateNow = Date.now;
+  let nowMs = 1_000;
+  Date.now = () => nowMs;
+
+  try {
+    const updater = module.createJobProgressUpdater("/workspace", "progress-same-phase");
+    updater({ phase: "running", threadId: "thread-1", turnId: "turn-1" });
+    assert.equal(stub.upsertCalls.length, 1);
+    assert.equal(typeof stub.upsertCalls[0].patch.progressUpdatedAt, "string");
+
+    nowMs += PROGRESS_UPDATE_THROTTLE_MS;
+    updater({ phase: "running", threadId: "thread-1", turnId: "turn-1" });
+
+    assert.equal(stub.upsertCalls.length, 2);
+    const samePhasePatch = stub.upsertCalls[1].patch;
+    assert.deepEqual(Object.keys(samePhasePatch).sort(), ["id", "progressUpdatedAt"].sort());
+    assert.equal(typeof samePhasePatch.progressUpdatedAt, "string");
+  } finally {
+    Date.now = originalDateNow;
+    cleanup();
+  }
+});
+
+test("createJobProgressUpdater throttles repeated same-phase progress writes", async () => {
+  const { module, stub, cleanup } = await importTrackedJobsWithStateStub();
+  const originalDateNow = Date.now;
+  Date.now = () => 2_000;
+
+  try {
+    const updater = module.createJobProgressUpdater("/workspace", "progress-throttled");
+    for (let index = 0; index < 10; index += 1) {
+      updater({ phase: "busy", threadId: "thread-1", turnId: "turn-1" });
+    }
+
+    assert.equal(stub.upsertCalls.length, 1);
+    assert.equal(stub.upsertCalls[0].patch.id, "progress-throttled");
+    assert.equal(stub.upsertCalls[0].patch.phase, "busy");
+    assert.equal(typeof stub.upsertCalls[0].patch.progressUpdatedAt, "string");
+  } finally {
+    Date.now = originalDateNow;
+    cleanup();
+  }
+});
+
+test("runTrackedJob terminal upsert patches clear active-only progress fields", async () => {
+  const { module, stub, cleanup } = await importTrackedJobsWithStateStub();
+
+  try {
+    await module.runTrackedJob(
+      { id: "terminal-completed", workspaceRoot: "/workspace", status: "queued", phase: "queued" },
+      async () => ({ exitStatus: 0, threadId: null, turnId: null, summary: "ok", payload: { ok: true }, rendered: "done" })
+    );
+
+    await assert.rejects(
+      module.runTrackedJob(
+        { id: "terminal-failed", workspaceRoot: "/workspace", status: "queued", phase: "queued" },
+        async () => {
+          throw new Error("runner failed");
+        }
+      ),
+      /runner failed/
+    );
+
+    const completedPatch = stub.upsertCalls.find((call) => call.patch.id === "terminal-completed")?.patch;
+    assert.equal(completedPatch.status, "completed");
+    assert.equal(completedPatch.staleness, null);
+    assert.equal(completedPatch.progressUpdatedAt, null);
+
+    const failedPatch = stub.upsertCalls.find((call) => call.patch.id === "terminal-failed")?.patch;
+    assert.equal(failedPatch.status, "failed");
+    assert.equal(failedPatch.staleness, null);
+    assert.equal(failedPatch.progressUpdatedAt, null);
+    assert.equal(stub.resolveProgressTimeoutCalls, 2);
+  } finally {
+    cleanup();
+  }
 });
