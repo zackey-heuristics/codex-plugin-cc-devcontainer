@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted — 2026-05-30.
+Accepted — 2026-05-30. Followed up by
+[ADR 0006](0006-stale-job-detection-and-reaping.md), which extends
+`reconcileStaleActiveJobs` to also tag live workers whose Codex turn has
+wedged or exceeded its useful budget — a class of stale-record this ADR
+left explicitly to the operator (live PID + verifying identity →
+"no action").
 
 Linked issue: <https://github.com/zackey-heuristics/codex-plugin-cc-devcontainer/issues/10>
 
