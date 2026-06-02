@@ -255,17 +255,83 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--enable-review-subagents\|--disable-review-subagents\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  // This fork defaults `/codex:setup` to enable review subagents by injecting
-  // `--enable-review-subagents` into $ARGS when the user passed neither
-  // enable nor disable for the flag. Both invocations of the companion
-  // (initial run + post-install rerun) use the same conditional-injection
-  // logic and pass the computed $ARGS instead of raw $ARGUMENTS.
-  const injectionPattern = /ARGS="\$ARGUMENTS";\s*case " \$ARGS " in[^]*?--enable-review-subagents[^]*?--disable-review-subagents[^]*?\*\)\s*ARGS="\$ARGS --enable-review-subagents"[^]*?esac;\s*node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" setup --json \$ARGS/;
-  const injectionMatches = setup.match(new RegExp(injectionPattern, "g")) ?? [];
-  assert.equal(injectionMatches.length, 2, "default-injection bash block should appear twice (initial run + rerun)");
+
+  // Bash-allowlist compatibility (PR #15 review): each bash block MUST start
+  // with `node` so it matches the `Bash(node:*)` allow-tools surface declared
+  // in the frontmatter. The previous `ARGS=...; case ... esac; node ...` form
+  // started with a shell assignment subcommand and could be blocked by
+  // Claude Code's permission matcher (which splits compound commands on
+  // shell operators and matches each subcommand independently).
+  const bashBlocks = [...setup.matchAll(/```bash\n([^]*?)\n```/g)].map((m) => m[1].trim());
+  // Setup has 3 bash blocks: initial run, npm install, post-install rerun.
+  // The two companion calls (initial + rerun) must start with `node` AND
+  // share the same default-injection logic. The npm install block is
+  // unchanged and irrelevant here.
+  const companionBlocks = bashBlocks.filter((b) => b.includes("codex-companion.mjs"));
+  assert.equal(companionBlocks.length, 2, "expected two bash blocks invoking the companion (initial run + rerun)");
+  for (const block of companionBlocks) {
+    assert.match(block, /^node\s+-e\s/, "bash block must start with `node -e ` so Bash(node:*) covers it");
+    assert.match(block, /--enable-review-subagents/, "block must reference --enable-review-subagents (default-injection flag)");
+    assert.match(block, /--disable-review-subagents/, "block must reference --disable-review-subagents (opt-out condition)");
+    assert.doesNotMatch(block, /^ARGS=/, "block must NOT start with a shell assignment subcommand");
+    assert.match(block, /-- "\$ARGUMENTS"/, "block must pass $ARGUMENTS quoted as a single positional after --");
+  }
   assert.doesNotMatch(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS\b/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("setup command wrapper composes args correctly when executed (PR #15 review)", async (t) => {
+  // Extract the node -e payload from setup.md and execute it against a fake
+  // companion so we prove the conditional-injection logic at runtime — not
+  // just by reading the bash block source.
+  const setup = read("commands/setup.md");
+  const wrapperMatch = setup.match(/node -e '([^]*?)' -- "\$ARGUMENTS"/);
+  assert.ok(wrapperMatch, "expected a `node -e '<payload>' -- \"$ARGUMENTS\"` wrapper in setup.md");
+  const payload = wrapperMatch[1];
+
+  const fakeRoot = makeTempDir("codex-setup-wrapper-");
+  fs.mkdirSync(path.join(fakeRoot, "scripts"), { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeRoot, "scripts", "codex-companion.mjs"),
+    "#!/usr/bin/env node\nconsole.log(process.argv.slice(2).join('|'));\nprocess.exit(parseInt(process.env.FAKE_EXIT ?? '0', 10));\n",
+    "utf8"
+  );
+  t.after(() => fs.rmSync(fakeRoot, { recursive: true, force: true }));
+
+  const { spawnSync } = await import("node:child_process");
+  function run(arg, extraEnv = {}) {
+    const result = spawnSync(
+      process.execPath,
+      ["-e", payload, "--", arg],
+      {
+        env: { ...process.env, CLAUDE_PLUGIN_ROOT: fakeRoot, ...extraEnv },
+        encoding: "utf8"
+      }
+    );
+    return { status: result.status, stdout: result.stdout.trim(), stderr: result.stderr };
+  }
+
+  // Case 1 — empty $ARGUMENTS: inject --enable-review-subagents.
+  assert.deepEqual(run("").stdout, "setup|--json|--enable-review-subagents");
+
+  // Case 2 — gate flag passes through; default-injection still fires.
+  assert.deepEqual(run("--enable-review-gate").stdout, "setup|--json|--enable-review-gate|--enable-review-subagents");
+
+  // Case 3 — explicit enable: no double-inject.
+  assert.deepEqual(run("--enable-review-subagents").stdout, "setup|--json|--enable-review-subagents");
+
+  // Case 4 — explicit disable: respects opt-out (NOT replaced with enable).
+  assert.deepEqual(run("--disable-review-subagents").stdout, "setup|--json|--disable-review-subagents");
+
+  // Case 5 — gate + disable: gate passes through, disable respected, NO inject.
+  assert.deepEqual(
+    run("--enable-review-gate --disable-review-subagents").stdout,
+    "setup|--json|--enable-review-gate|--disable-review-subagents"
+  );
+
+  // Case 6 — exit-code propagation: fake exits 7 → wrapper exits 7.
+  assert.equal(run("", { FAKE_EXIT: "7" }).status, 7);
 });
